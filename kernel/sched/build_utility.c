@@ -104,3 +104,7 @@
 #ifdef CONFIG_SCHED_AUTOGROUP
 # include "autogroup.c"
 #endif
+
+#ifdef CONFIG_SCHED_HINT
+#include "hint.c"
+#endif

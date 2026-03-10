@@ -15,6 +15,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
+#include <linux/sched/hint.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/user.h>
 #include <linux/sched/numa_balancing.h>
@@ -553,6 +554,13 @@ void free_task(struct task_struct *tsk)
 	if (tsk->flags & PF_KTHREAD)
 		free_kthread_struct(tsk);
 	bpf_task_storage_free(tsk);
+#ifdef CONFIG_SCHED_HINT
+	if (tsk->sched_hint_page) {
+		unpin_user_page(tsk->sched_hint_page);
+		tsk->sched_hint_page = NULL;
+		tsk->sched_hint_kaddr = NULL;
+	}
+#endif
 	free_task_struct(tsk);
 }
 EXPORT_SYMBOL(free_task);
@@ -2232,6 +2240,29 @@ __latent_entropy struct task_struct *copy_process(
 	retval = copy_thread(p, args);
 	if (retval)
 		goto bad_fork_cleanup_io;
+
+#ifdef CONFIG_SCHED_HINT
+	if (clone_flags & CLONE_SETTLS && current->mm->has_sched_hint) {
+		unsigned long new_tp = args->tls;
+		unsigned long hint_vaddr = new_tp + current->mm->sched_hint_offset;
+		if (!access_ok((void __user *)hint_vaddr, 64)) {
+			retval = -EINVAL;
+		}
+		struct page *page;
+		struct sched_hint *hint;
+		if (pin_user_pages_fast(hint_vaddr, 1, FOLL_WRITE | FOLL_LONGTERM, &page) == 1) {
+			hint = (struct sched_hint *)(page_address(page) + (hint_vaddr & ~PAGE_MASK));
+			/* Validate the magic number */
+			if (hint && hint->magic == SCHED_HINT_MAGIC) {
+				p->sched_hint_kaddr = hint;
+				p->sched_hint_page = page;
+			} else {
+				retval = -EINVAL;
+			}
+		}
+
+	}
+#endif
 
 	stackleak_task_init(p);
 

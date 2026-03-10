@@ -1371,6 +1371,10 @@ struct mm_struct {
 #ifdef CONFIG_MM_ID
 		mm_id_t mm_id;
 #endif /* CONFIG_MM_ID */
+#ifdef CONFIG_SCHED_HINT
+		unsigned long sched_hint_offset;
+		bool has_sched_hint;
+#endif
 	} __randomize_layout;
 
 	/*

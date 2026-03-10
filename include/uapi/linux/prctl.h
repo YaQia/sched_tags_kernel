@@ -423,4 +423,7 @@ struct prctl_mm_map {
  */
 #define PR_LOCK_INDIR_BR_LP_STATUS      82
 
+/* Scheduler hint offset prctl */
+#define PR_SET_SCHED_HINT_OFFSET        83
+
 #endif /* _LINUX_PRCTL_H */

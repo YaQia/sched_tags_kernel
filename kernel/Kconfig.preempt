@@ -192,3 +192,12 @@ config SCHED_CLASS_EXT
 	  For more information:
 	    Documentation/scheduler/sched-ext.rst
 	    https://github.com/sched-ext/scx
+
+config SCHED_HINT
+	bool "Scheduler hint support"
+	default y
+    help
+      This enables support for scheduler hints, which allows compiler to 
+	  instrument modification of sched_hint data structure. These hints are 
+	  stored and modified on userspace, but can be accessed by task_struct on 
+	  kernel. These information could be used both on any scheduler.

@@ -5,6 +5,7 @@
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
+#include "linux/sched/hint.h"
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
@@ -2903,6 +2904,13 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EINVAL;
 		error = arch_lock_indir_br_lp_status(me, arg2);
 		break;
+#ifdef CONFIG_SCHED_HINT
+	case PR_SET_SCHED_HINT_OFFSET:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = set_sched_hint_prctl(arg2);
+		break;
+#endif
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
 		error = -EINVAL;

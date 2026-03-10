@@ -1635,6 +1635,10 @@ struct task_struct {
 #ifdef CONFIG_UNWIND_USER
 	struct unwind_task_info		unwind_info;
 #endif
+#ifdef CONFIG_SCHED_HINT
+	struct sched_hint		*sched_hint_kaddr;
+	struct page			*sched_hint_page;
+#endif
 
 	/* CPU-specific state of this task: */
 	struct thread_struct		thread;
