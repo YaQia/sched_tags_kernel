@@ -29,7 +29,7 @@
  *   }
  */
 #ifdef CONFIG_SCHED_HINT
-extern int set_sched_hint_prctl(unsigned long arg2);
+extern int set_sched_hint_prctl(unsigned long arg2, unsigned long arg3);
 #endif /* CONFIG_SCHED_HINT */
 
 #endif /* _LINUX_SCHED_HINT_H */

@@ -7,6 +7,9 @@
 /* Constants */
 #define SCHED_HINT_MAGIC 0x5348494EU /* "SHIN" in ASCII                     */
 #define SCHED_HINT_VERSION 1
+#ifndef PR_SET_SCHED_HINT_OFFSET
+#define PR_SET_SCHED_HINT_OFFSET 83
+#endif
 
 /* Section name — valid C identifier so linker generates __start_ / __stop_   */
 #define SCHED_HINT_SECTION "__sched_hint"
@@ -44,14 +47,14 @@
 /* bits 8..63: reserved for future tags                                       */
 
 /*
- * compute-dense sub-type (2 bits)
+ * compute-dense sub-type (bitmask, 3 bits)
  * Encodes the dominant compute type when SCHED_TAG_COMPUTE_DENSE is set.
  */
 
-#define SCHED_COMPUTE_NONE 0 /* no dominant compute type                   */
-#define SCHED_COMPUTE_INT 1 /* integer ALU dominant                       */
-#define SCHED_COMPUTE_FLOAT 2 /* floating-point dominant                    */
-#define SCHED_COMPUTE_SIMD 3 /* vector / SIMD dominant                     */
+#define SCHED_COMPUTE_NONE 0 /* no compute type present */
+#define SCHED_COMPUTE_INT (1U << 0) /* integer ALU dominant */
+#define SCHED_COMPUTE_FLOAT (1U << 1) /* floating-point dominant */
+#define SCHED_COMPUTE_SIMD (1U << 2) /* vector / SIMD dominant */
 
 /*
  * memory-dense sub-type (2 bits)
@@ -140,11 +143,11 @@ _Static_assert(sizeof(struct sched_hint) == 64,
  *
  * Fast-path check example:
  *   if (hint->tags_active & SCHED_TAG_COMPUTE_DENSE) {
- *       switch (hint->compute_dense) {
- *       case SCHED_COMPUTE_INT:   ... break;
- *       case SCHED_COMPUTE_FLOAT: ... break;
- *       case SCHED_COMPUTE_SIMD:  ... break;
- *       }
+ *	 uint8_t m = hint->compute_dense;
+ *
+ *	 if (m & SCHED_COMPUTE_INT)   { ... }
+ *	 if (m & SCHED_COMPUTE_FLOAT) { ... }
+ *	 if (m & SCHED_COMPUTE_SIMD)  { ... }
  *   }
  */
 

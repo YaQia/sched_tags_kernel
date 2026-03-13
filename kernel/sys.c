@@ -2906,9 +2906,9 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		break;
 #ifdef CONFIG_SCHED_HINT
 	case PR_SET_SCHED_HINT_OFFSET:
-		if (arg3 || arg4 || arg5)
+		if (arg4 || arg5)
 			return -EINVAL;
-		error = set_sched_hint_prctl(arg2);
+		error = set_sched_hint_prctl(arg2, arg3);
 		break;
 #endif
 	default:

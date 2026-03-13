@@ -2242,9 +2242,13 @@ __latent_entropy struct task_struct *copy_process(
 		goto bad_fork_cleanup_io;
 
 #ifdef CONFIG_SCHED_HINT
-	if (clone_flags & CLONE_SETTLS && current->mm->has_sched_hint) {
+	/*
+	 * At this point, we did copy_mm already.
+	 * No need for copy mm->sched_hint_offset.
+	 */
+	if (clone_flags & CLONE_SETTLS && p->mm->has_sched_hint) {
 		unsigned long new_tp = args->tls;
-		unsigned long hint_vaddr = new_tp + current->mm->sched_hint_offset;
+		unsigned long hint_vaddr = new_tp + p->mm->sched_hint_offset;
 		if (!access_ok((void __user *)hint_vaddr, 64)) {
 			retval = -EINVAL;
 		}
@@ -2260,7 +2264,8 @@ __latent_entropy struct task_struct *copy_process(
 				retval = -EINVAL;
 			}
 		}
-
+		if (retval)
+			goto bad_fork_cleanup_io;
 	}
 #endif
 
