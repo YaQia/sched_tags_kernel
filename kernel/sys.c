@@ -5,7 +5,6 @@
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
-#include "linux/sched/hint.h"
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
@@ -63,6 +62,7 @@
 #include <linux/sched/coredump.h>
 #include <linux/sched/task.h>
 #include <linux/sched/cputime.h>
+#include <linux/sched/hint.h>
 #include <linux/rcupdate.h>
 #include <linux/uidgid.h>
 #include <linux/cred.h>
@@ -2908,7 +2908,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	case PR_SET_SCHED_HINT_OFFSET:
 		if (arg4 || arg5)
 			return -EINVAL;
-		error = set_sched_hint_prctl(arg2, arg3);
+		error = set_sched_hint_prctl(me, arg2, arg3);
 		break;
 #endif
 	default:
