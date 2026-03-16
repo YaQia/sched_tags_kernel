@@ -6,6 +6,24 @@
 #include <linux/mmap_lock.h>
 #include <linux/types.h>
 
+/*
+ * Force BTF generation for scheduling hint enums.
+ *
+ * The compiler only emits DWARF (and hence BTF) entries for types that are
+ * actually *referenced as types* in a translation unit.  Using an enum
+ * constant (e.g.  SCHED_HINT_MAGIC) in an expression is not enough -- the
+ * compiler folds it to an integer literal and never records the enum type.
+ *
+ * Declaring an unused pointer variable of each enum type is the lightest
+ * way to make the compiler emit the type information.  pahole then converts
+ * DWARF -> BTF, and `bpftool btf dump` makes them visible in vmlinux.h.
+ */
+enum sched_hint_metadata *__btf_sched_hint_metadata __attribute__((unused));
+enum sched_hint_compute_dense *__btf_sched_hint_compute_dense
+	__attribute__((unused));
+enum sched_hint_memory_dense *__btf_sched_hint_memory_dense
+	__attribute__((unused));
+
 int set_sched_hint_prctl(struct task_struct *t, unsigned long arg2,
 			 unsigned long arg3)
 {
