@@ -65,7 +65,7 @@ int set_sched_hint_prctl(struct task_struct *t, unsigned long arg2,
 		t->sched_hint_page = page;
 	} else {
 		ret = -EINVAL;
-		pr_info("sched_hint_kaddr set failed: hint magic not matched, hint->atomic_magic is %x, should be %x\n",
+		pr_info("sched_hint_kaddr set failed: hint magic not matched, hint->magic is %x, should be %x\n",
 			hint->magic, SCHED_HINT_MAGIC);
 		goto err;
 	}

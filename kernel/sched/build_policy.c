@@ -57,6 +57,10 @@
 #include "cputime.c"
 #include "deadline.c"
 
+#ifdef CONFIG_SCHED_HINT
+# include <linux/sched/hint.h>
+#endif
+
 #ifdef CONFIG_SCHED_CLASS_EXT
 # include "ext_internal.h"
 # include "ext.c"

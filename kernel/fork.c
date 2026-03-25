@@ -2254,8 +2254,12 @@ __latent_entropy struct task_struct *copy_process(
 		}
 		struct page *page;
 		struct sched_hint *hint;
-		if (pin_user_pages_fast(hint_vaddr, 1, FOLL_WRITE | FOLL_LONGTERM, &page) == 1) {
-			hint = (struct sched_hint *)(page_address(page) + (hint_vaddr & ~PAGE_MASK));
+		if ((retval = pin_user_pages_fast(hint_vaddr, 1,
+						  FOLL_WRITE | FOLL_LONGTERM,
+						  &page)) == 1) {
+			retval = 0;
+			hint = (struct sched_hint *)
+				(page_address(page) + (hint_vaddr & ~PAGE_MASK));
 			/* Validate the magic number */
 			if (hint && hint->magic == SCHED_HINT_MAGIC) {
 				p->sched_hint_kaddr = hint;

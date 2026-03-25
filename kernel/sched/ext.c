@@ -7359,6 +7359,18 @@ __bpf_kfunc void scx_bpf_events(struct scx_event_stats *events,
 	memcpy(events, &e_sys, events__sz);
 }
 
+#ifdef CONFIG_SCHED_HINT
+__bpf_kfunc void scx_bpf_clear_sched_hint(struct task_struct *p)
+{
+	struct sched_hint *hint = p->sched_hint_kaddr;
+	if (!hint)
+		return;
+	memset((char *)hint + offsetof(struct sched_hint, compute_dense),
+	       0,
+	       sizeof(struct sched_hint) - offsetof(struct sched_hint, compute_dense));
+}
+#endif
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(scx_kfunc_ids_any)
@@ -7393,6 +7405,9 @@ BTF_ID_FLAGS(func, scx_bpf_task_cgroup, KF_RCU | KF_ACQUIRE)
 #endif
 BTF_ID_FLAGS(func, scx_bpf_now)
 BTF_ID_FLAGS(func, scx_bpf_events)
+#ifdef CONFIG_SCHED_HINT
+BTF_ID_FLAGS(func, scx_bpf_clear_sched_hint, KF_RCU)
+#endif
 BTF_KFUNCS_END(scx_kfunc_ids_any)
 
 static const struct btf_kfunc_id_set scx_kfunc_set_any = {
