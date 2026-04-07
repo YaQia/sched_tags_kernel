@@ -8,7 +8,7 @@
  * We use enum here to export them in vmlinux easily.
  */
 enum sched_hint_metadata {
-	SCHED_HINT_MAGIC = 0x5348494E, /* "SHIN" in ASCII */
+	SCHED_HINT_MAGIC = 0x5348494EU, /* "SHIN" in ASCII */
 	SCHED_HINT_VERSION = 1,
 };
 
@@ -56,11 +56,32 @@ enum sched_hint_memory_dense {
  *   Extended payloads:
  *
  *   [16..23]  atomic_magic   magic number for atomic co-scheduling
- *   [24..31]  dep_magic      dependency magic number for IPC grouping
- *   [32]      dep_role       0 = producer, 1 = consumer
- *   [33..39]  reserved1[7]   future use
+ *   [24..31]  dep_magic      — dependency magic number for IPC grouping
  *
- *   [40..63]  reserved2[24]  padding for future tag payloads
+ *   [32..39]  unshared_magic — 64-bit bloom filter for unshared co-scheduling
+ *             Encodes which critical section variables (mutex, semaphore,
+ *             etc.) this thread's unshared region is protecting.
+ *
+ *             Unlike atomic_magic (for lock-free CAS), unshared_magic tracks
+ *             exclusive resource ownership (locks, critical sections).
+ *
+ *             Uses same bloom filter hash as atomic_magic:
+ *             Hash:  h = (aligned_ptr) * 0x9E3779B97F4A7C15  (fibonacci)
+ *             Bits:  bloom |= (1 << (h & 63))
+ *                         | (1 << ((h>>16) & 63))
+ *                         | (1 << ((h>>32) & 63))
+ *                         | (1 << ((h>>48) & 63))    (k=4 bits per ptr)
+ *
+ *             Scheduler usage:
+ *               When a task with unshared=1 is about to be preempted:
+ *               overlap = popcount(magic_a & magic_b) >= 4
+ *               → true:  another RUNNING task holds same lock → extend slice
+ *               → false: no contention detected → normal preemption
+ *             This prevents priority inversion by extending time slice when
+ *             another thread is waiting for the same critical section.
+ *
+ *   [40]      dep_role       — 0 = producer, 1 = consumer
+ *   [41..63]  reserved[23]   — padding for future tag payloads
  */
 struct sched_hint {
 	/* header (8 bytes) */
@@ -80,11 +101,11 @@ struct sched_hint {
 	/* extended payloads (24 bytes) */
 	__u64 atomic_magic;
 	__u64 dep_magic;
+	__u64 unshared_magic;
 	__u8 dep_role; /* 0 = producer, 1 = consumer */
-	__u8 reserved1[7];
 
-	/* reserved for future tag types (24 bytes) */
-	__u8 reserved2[24];
+	/* reserved for future tag types (23 bytes) */
+	__u8 reserved2[23];
 } __attribute__((aligned(64)));
 
 /*
@@ -112,7 +133,8 @@ struct sched_hint {
  *   }
  */
 #ifdef CONFIG_SCHED_HINT
-int set_sched_hint_prctl(struct task_struct *t, unsigned long arg2, unsigned long arg3);
+int set_sched_hint_prctl(struct task_struct *t, unsigned long arg2,
+			 unsigned long arg3);
 #endif /* CONFIG_SCHED_HINT */
 
 #endif /* _LINUX_SCHED_HINT_H */
