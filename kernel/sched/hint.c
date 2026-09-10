@@ -5,6 +5,23 @@
 #include <linux/mm_types.h>
 #include <linux/mmap_lock.h>
 #include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/stddef.h>
+
+/*
+ * The 64-byte layout is an ABI contract shared with the userspace header
+ * and the LLVM pass. Pin it down at compile time.
+ */
+static_assert(sizeof(struct sched_hint) == 64);
+static_assert(offsetof(struct sched_hint, exec_dense) == 8);
+static_assert(offsetof(struct sched_hint, memory_dense) == 9);
+static_assert(offsetof(struct sched_hint, atomic_dense) == 10);
+static_assert(offsetof(struct sched_hint, unshared) == 11);
+static_assert(offsetof(struct sched_hint, load_trend) == 12);
+static_assert(offsetof(struct sched_hint, atomic_magic) == 16);
+static_assert(offsetof(struct sched_hint, dep_magic) == 24);
+static_assert(offsetof(struct sched_hint, unshared_magic) == 32);
+static_assert(offsetof(struct sched_hint, dep_role) == 40);
 
 /*
  * Force BTF generation for scheduling hint enums.
@@ -19,9 +36,17 @@
  * DWARF -> BTF, and `bpftool btf dump` makes them visible in vmlinux.h.
  */
 enum sched_hint_metadata *__btf_sched_hint_metadata __attribute__((unused));
-enum sched_hint_compute_dense *__btf_sched_hint_compute_dense
+enum sched_hint_exec_dense *__btf_sched_hint_exec_dense
 	__attribute__((unused));
 enum sched_hint_memory_dense *__btf_sched_hint_memory_dense
+	__attribute__((unused));
+enum sched_hint_load_trend *__btf_sched_hint_load_trend
+	__attribute__((unused));
+enum sched_hint_atomic_dense *__btf_sched_hint_atomic_dense
+	__attribute__((unused));
+enum sched_hint_unshared *__btf_sched_hint_unshared
+	__attribute__((unused));
+enum sched_hint_dep_role *__btf_sched_hint_dep_role
 	__attribute__((unused));
 
 int set_sched_hint_prctl(struct task_struct *t, unsigned long arg2,
@@ -60,20 +85,29 @@ int set_sched_hint_prctl(struct task_struct *t, unsigned long arg2,
 
 	unsigned long page_offset = main_vaddr & ~PAGE_MASK;
 	hint = (struct sched_hint *)(page_address(page) + page_offset);
-	if (hint && hint->magic == SCHED_HINT_MAGIC) {
-		t->sched_hint_kaddr = hint;
-		t->sched_hint_page = page;
-	} else {
+	if (!hint || hint->magic != SCHED_HINT_MAGIC) {
 		ret = -EINVAL;
 		pr_info("sched_hint_kaddr set failed: hint magic not matched, hint->magic is %x, should be %x\n",
-			hint->magic, SCHED_HINT_MAGIC);
-		goto err;
+			hint ? hint->magic : 0, SCHED_HINT_MAGIC);
+		goto err_unpin;
 	}
+	if (hint->version != SCHED_HINT_VERSION) {
+		ret = -EINVAL;
+		pr_info("sched_hint_kaddr set failed: version mismatch (hint has %u, kernel expects %u) — userspace sched_hint.h and kernel out of sync\n",
+			hint->version, SCHED_HINT_VERSION);
+		goto err_unpin;
+	}
+
+	t->sched_hint_kaddr = hint;
+	t->sched_hint_page = page;
 
 	/* offset is reserved for other threads to use */
 	t->mm->sched_hint_offset = offset;
 	t->mm->has_sched_hint = true;
 	return 0;
+
+err_unpin:
+	unpin_user_page(page);
 err:
 	printk(KERN_WARNING "set_sched_hint_prctl failed, ret = %d\n", ret);
 	return ret;
