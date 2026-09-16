@@ -48,6 +48,23 @@
   - 内核侧指针现在指向**内核自有页**（`page_address` 永久有效），跨任务读天然成立。
 - **子线程不自动分配**：每线程各自调一次 `prctl` 拿自己的地址（因为要 `put_user` 回填，只能在该线程
   自身上下文做）。取代旧的「clone 时自动 pin」。
+- **VMA 保护走 `VM_SEALED`（mseal），不手写 patch munmap 入口**。本内核为 7.0-rc2，mseal 已进主线：
+  `mm/vma.c:1403/1423`（整段/部分 munmap）、`mm/mremap.c:1666`、`mm/mprotect.c:706`、`mm/madvise.c:1302`
+  都已有 `vma_is_sealed()` 检查返回 `-EPERM`，upstream 长期维护，**打个 `VM_SEALED` flag 即免费复用**。
+  - 依据：既满足「禁 munmap，防一个线程 munmap 掉全进程调度能力」，又不用长期维护侵入式 mm patch。
+  - 局限：`mm/vma.h:667` 明确 `VM_SEALED` 在**非 64 位恒为 `VM_NONE`、`vma_is_sealed()` 恒 false**，
+    即 seal 在 32 位是 no-op。32 位接受降级（见下「释放点解耦」，靠 refcount 兜底不崩，只是自废武功）。
+  - VMA flags：`VM_SEALED | VM_DONTEXPAND | VM_DONTCOPY`
+    （`SEALED` 防 munmap/mremap/mprotect、`DONTEXPAND` 防扩张、`DONTCOPY` 防 fork 复制 VMA）。
+- **释放点与 seal 正交，统一放 mm 销毁钩子（`__mmput`），`.close` 一律空转**。这是本次讨论纠正的关键点：
+  - **不要把释放塞进 `.close`**。`.close` 是逐-VMA 回调，任何 VMA 消失都触发（munmap/mremap/exec/exit）。
+    32 位未 seal 时用户 munmap 会中途触发 `.close`，若在此 `put_page` → 页释放但存活线程 `sched_hint_kaddr`
+    悬挂 → **UAF**，且与「refcount 兜底」直接矛盾（兜底成立的前提就是 `.close` 不 put_page）。
+  - **正解**：`page->_refcount` 有两份——`area->pages[i]` 一份（内核持有）、用户 PTE 一份（`vm_insert_page` 加）。
+    munmap 只掉 PTE 那份，`area->pages[i]` 那份仍在 → 页不释放 → kaddr 永久有效。真正 `put_page` 只在
+    `__mmput` 里做一次。于是：64 位 seal 挡住 munmap；32 位 munmap → `.close` 空转 → 页 refcount 停在 1 →
+    活着（自废武功但不崩）。**一套代码同时覆盖 32/64 位，无矛盾。**
+  - `VM_SEALED` 退化为纯粹的「防用户自废武功」增益，**不影响释放正确性**。
 
 ## 2. 目标架构
 
@@ -81,14 +98,21 @@ int                sched_hint_slot;   /* -1 = 无 */
 
 ### 关键流程
 1. **首个注册线程**：分配 `sched_hint_area`，`vm_mmap` 建 `SCHED_HINT_MAX_SLOTS*64` 的特殊 VMA
-   （自定义 `vm_operations_struct`：`.fault` 惰性填页、`.close` 清理），存 `uaddr_base`。
+   （自定义 `vm_operations_struct`：`.fault` 惰性填页、`.close` **空转**），
+   flags 打 `VM_SEALED | VM_DONTEXPAND | VM_DONTCOPY`，存 `uaddr_base`。
 2. **每次 prctl**：位图取空闲 slot `i` → 若 `pages[i/64]` 空则 `alloc_page` 并写好 magic/version →
    算内核侧 `task->sched_hint_kaddr` 与用户侧 `uaddr = uaddr_base + i*64` → `put_user(uaddr, arg2)` →
    记 `task->sched_hint_slot = i`。
 3. **`.fault`**：用户访问某页 → 找/分配对应内核页 → `vm_insert_page`（保证内核侧与用户侧同一张物理页）。
-4. **线程退出（free_task/exit_thread 附近）**：归还 slot 到位图，清 `task->sched_hint_kaddr/slot`；**不释放页**。
-5. **进程退出 / VMA `.close`**：释放所有 `pages[]`、位图、area。
-6. **跨任务读**：`p->sched_hint_kaddr`（判 NULL 后）直接读，`p != current` 成立。
+   注意：`vm_insert_page` 会给页加一份 `_refcount`（用户 PTE 那份），`area->pages[i]` 另持一份。
+4. **线程退出（`exit_mm` 之前、`task->mm` 仍持引用处）**：持 `area->lock` 归还 slot 到位图，
+   清 `task->sched_hint_kaddr/slot`；**不释放页**。安全性：还 slot 时该线程尚未 mmput，area 必然还在；
+   且该 task 即将 dead，调度器不会再读它的 kaddr → **还 slot 无需与调度器读同步**（只有位图位操作要锁）。
+5. **进程退出**：在 `__mmput` 里 `exit_mmap(mm)` **之后**调 `sched_hint_free_area(mm)`——
+   以 `mm->sched_hint_area` 为准，`put_page` 所有 `pages[]` + free 位图 + free area + 置 NULL，**只跑一次**。
+   放 `exit_mmap` 之后：此时用户 PTE 那份 refcount 已被 `exit_mmap` 掉，`put_page` 归零、页干净回 buddy。
+   **`.close` 不参与释放**（见第 1 节「释放点解耦」）。
+6. **跨任务读**：`p->sched_hint_kaddr`（判 NULL 后）直接读，`p != current` 成立。读侧不加锁。
 
 ## 3. 分阶段任务清单（TODO）
 
@@ -115,15 +139,36 @@ int                sched_hint_slot;   /* -1 = 无 */
 
 ### 阶段 C：VMA 与惰性映射
 - [ ] `kernel/sched/hint.c`（或新文件）：`vm_operations_struct { .fault, .close }`。
-      `.fault`：按 vmf->pgoff 找/分配内核页，`vm_insert_page`。`.close`：触发 area 释放（或最后一个 VMA 关闭时）。
-- [ ] 用 `vm_mmap` + 手动装 vm_ops 建预留 VMA（参考 mmap 特殊映射的做法，如 `install_special_mapping` 可能更合适——待评估）。
-      **评估点**：`install_special_mapping` vs 自定义 `.mmap`——前者更省事且专为「内核提供页」设计。
+      `.fault`：按 vmf->pgoff 找/分配内核页，`vm_insert_page`（同时给页加用户 PTE 那份 refcount）。
+      `.close`：**空转**（可留 debug `WARN`）——**绝不 put_page**，释放统一在 `__mmput`（见阶段 D）。
+- [ ] 建预留 VMA：`vm_mmap` + 手动装 vm_ops，flags 打 `VM_SEALED | VM_DONTEXPAND | VM_DONTCOPY`。
+      `VM_SEALED` 复用 upstream mseal 拦截（`mm/vma.c`、`mm/mremap.c`、`mm/mprotect.c`、`mm/madvise.c`），
+      64 位免费禁 munmap/mremap/mprotect/madvise-discard；32 位 no-op（`VM_SEALED == VM_NONE`），靠 refcount 兜底。
+      **评估点**：`install_special_mapping` vs 自定义 `.mmap`——前者更省事且专为「内核提供页」设计，
+      但要确认其能否叠加 `VM_SEALED`；若不行则自定义 `.mmap` 里手动设 flags。
+- [ ] `.may_split` 返回 `-EINVAL`、`.mremap` 返回 `-EINVAL`：作为 32 位的部分兜底（挡部分操作），
+      64 位有 seal 后冗余但无害。注意：整段 munmap 在 32 位无干净拦法（mseal 机制本身的限制），接受降级。
 
-### 阶段 D：fork / exit 清理
-- [ ] `kernel/fork.c`：删掉 `copy_thread` 附近的 clone-pin 段（2247-2267 区域）与 free_task 的 unpin 段（558-561）。
-      换成：free_task 时若 `sched_hint_slot >= 0` 则归还 slot。
-- [ ] mm 销毁路径（`__mmput`/`exit_mmap` 附近）：释放 `sched_hint_area`（页、位图、结构体）。
-      注意与 VMA `.close` 的职责划分，别 double-free。
+### 阶段 D：fork / exit 清理（DF/UAF 向量逐条处理）
+> 根因：`dup_task_struct`/`dup_mm` 是结构体**浅拷贝**，会把 hint 指针/slot 原样复制给子 task/子 mm。
+> 新模型无 pin refcount 兜底，每处必须显式清。三大杀手：DF1（共享 area 指针）、DF2（继承 slot）、UAF2（exec 换 mm）。
+- [ ] **DF1**：`mm_init()`（约 `kernel/fork.c:1079`）无条件 `mm->sched_hint_area = NULL;`。
+      fresh mm 和 dup mm 都过这里；否则子 mm 浅拷贝父 area 指针 → teardown 双重释放 + slot 位图打架。
+- [ ] **DF2（最关键）**：`dup_task_struct()`（约 `kernel/fork.c:952`，`seccomp.filter = NULL` 那一带）显式
+      `tsk->sched_hint_kaddr = NULL; tsk->sched_hint_slot = -1;`。否则子线程继承父 slot → 退出时释放父的 slot。
+- [ ] **UAF2**：`fs/exec.c` `begin_new_exec()`（:1091）在 `exec_mmap()`（:1148）**之前**清
+      `current->sched_hint_kaddr = NULL; current->sched_hint_slot = -1;`。exec 换 mm 后旧 area 被 `__mmput` 释放，
+      存活的 exec 线程 task 不变、kaddr 会悬挂。放 exec_mmap 之前是不给调度器留读悬挂指针的窗口。
+- [ ] **删除旧 pin 代码**：`kernel/fork.c:558-562`（free_task 的 unpin 段）、
+      `kernel/fork.c:2244-2274`（copy_thread 后的 clone-pin 段）。
+- [ ] **free_task 不还 slot**：`free_task` 时 `task->mm` 已 NULL、area 可能已被 `__mmput` 释放，
+      在此还 slot 会写已释放的 bitmap → UAF。`free_task` 对 hint 只做空操作（可 `WARN_ON_ONCE(kaddr)` 断言）。
+- [ ] **还 slot 放对位置**：`kernel/exit.c` `do_exit`/`exit_mm` 中、`exit_mm()` 之前（`task->mm` 仍持引用处），
+      新增 `sched_hint_exit_task(current)`：持 `area->lock` 清位图 bit + 清本 task kaddr/slot。
+- [ ] **释放 area（唯一真源）**：`kernel/fork.c:1174` `__mmput` 里、`exit_mmap(mm)` **之后**调
+      `sched_hint_free_area(mm)`：以 `mm->sched_hint_area` 为准，`put_page` 所有 pages + free bitmap + free area + 置 NULL。
+      只跑一次。**与 `.close` 职责划分**：`.close` 空转，释放只在这里，从根上杜绝 double-free 和 32 位 munmap-UAF。
+- [ ] **prctl 错误路径**：若 area 已建但后续步骤失败，就地释放 area 并把 `mm->sched_hint_area` 置回 NULL。
 
 ### 阶段 E：sched_ext / BPF 侧
 - [ ] `kernel/sched/ext.c`：删除 `scx_bpf_clear_sched_hint` kfunc + BTF 注册。
@@ -146,11 +191,24 @@ int                sched_hint_slot;   /* -1 = 无 */
 
 ## 4. 待评估 / 风险点（实现时注意）
 - **`install_special_mapping` vs 自定义 `.mmap`/`vm_mmap`**：优先评估 `install_special_mapping`
-  （专为内核页映射设计，vm_ops 挂 `.fault`，清理更省心）。
-- **`.close` 与 mm 销毁的清理职责划分**：避免 double-free；建议 area 释放集中在一处，另一处只解引用置空。
+  （专为内核页映射设计，vm_ops 挂 `.fault`，清理更省心）。**确认能否叠加 `VM_SEALED`**，不行则自定义 `.mmap` 手设 flags。
+- **`.close` 与 mm 销毁的清理职责划分（已定论）**：`.close` **一律空转、绝不 put_page**；
+  area/pages/bitmap 释放**只**在 `__mmput`（`exit_mmap` 之后）`sched_hint_free_area` 一处做一次。
+  理由：`.close` 是逐-VMA 回调，32 位未 seal 时 munmap 会中途触发它，若在此 put_page → 存活线程 kaddr 悬挂 UAF，
+  且与 refcount 兜底矛盾。把释放解耦到「mm 消失」这一唯一时刻，32/64 位一套代码、无 double-free、无 UAF。
+- **refcount 兜底原理**：页有两份 `_refcount`——`area->pages[i]`（内核持有）+ 用户 PTE（`vm_insert_page` 加）。
+  用户 munmap 只掉 PTE 那份，`area->pages[i]` 那份仍在 → 页不进回收 → `page_address()` 算的 kaddr 永久有效。
+  这是新模型对 pin 方案的根本升级：内核拥有**自己的页**，用户页表只是其视图；撤视图不动数据源。
+- **`VM_SEALED` 与释放正交**：seal 只决定「用户能否中途拆 VMA」（64 位不能/32 位能），
+  释放点始终是 `__mmput`，与 seal 无关。别把两者耦合（本次讨论纠正的关键教训）。
 - **并发**：`sched_hint_area->lock`（mutex）保护 slot 位图与 pages[]；注意 prctl 上下文可睡眠，
   但调度器读 `sched_hint_kaddr` 在原子上下文——**读侧不加锁**，靠「指针一旦设好就稳定、页永不释放（进程存活期间）」保证。
-  线程退出归还 slot 时，要保证调度器不会再读到该 task 的 kaddr（task 已 dead，天然成立）。
+- **还 slot 无需与调度器读同步（已澄清）**：还 slot 只清位图一个 bit；被还的 task 即将 dead，
+  调度器不会再通过 `p->sched_hint_kaddr` 读它 → 无争用。slot 被新线程复用时是**另一个 task_struct**，
+  指针绑 task、老 task 死了没人读，不会「读到上一租户残留」。锁只护位图位操作，读路径完全不碰锁。
+- **32 位降级（已接受）**：`VM_SEALED == VM_NONE`、`vma_is_sealed()` 恒 false，seal 全 no-op。
+  32 位用户可 munmap 自己的映射（自废武功），但靠 refcount 兜底**不崩**（页 refcount 停在 1，kaddr 仍有效），
+  后续该线程写 hint 会段错误——属预期行为。sched_ext 场景几乎只在 64 位，不为 32 位投入侵入式 patch。
 - **跨任务读的内存序**：`p->sched_hint_kaddr` 设置（prctl）与调度器读之间，靠常规发布语义；
   内核自有页内容由用户写、内核读，仍是 best-effort，无需 barrier（与原设计一致）。
 - **magic/version**：内核建页时写入；用户不应改 magic。跨任务读时可选择校验 magic（已在内核控制下，可省）。
