@@ -1372,8 +1372,14 @@ struct mm_struct {
 		mm_id_t mm_id;
 #endif /* CONFIG_MM_ID */
 #ifdef CONFIG_SCHED_HINT
-		unsigned long sched_hint_offset;
-		bool has_sched_hint;
+		/*
+		 * Per-mm scheduling-hint area: a reserved user VMA plus the
+		 * kernel-owned pages backing it, packed into 64-byte slots and
+		 * shared by all threads of this process. NULL = not enabled.
+		 * Lifetime is bound to the mm; freed once in __mmput() after
+		 * exit_mmap(). See kernel/sched/hint.c.
+		 */
+		struct sched_hint_area *sched_hint_area;
 #endif
 	} __randomize_layout;
 

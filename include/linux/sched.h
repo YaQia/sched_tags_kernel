@@ -1636,8 +1636,23 @@ struct task_struct {
 	struct unwind_task_info		unwind_info;
 #endif
 #ifdef CONFIG_SCHED_HINT
+	/*
+	 * Kernel-side pointer to this thread's slot in the kernel-owned hint
+	 * pages: page_address(area->pages[slot / SLOTS_PER_PAGE]) +
+	 * (slot % SLOTS_PER_PAGE) * SCHED_HINT_SLOT_SIZE.
+	 *
+	 * Valid for the lifetime of THIS thread: stored once at registration
+	 * (prctl), never modified by area maintenance while the thread lives,
+	 * and cleared by the thread's own exit path, which also returns the
+	 * slot for reuse by another thread. The scheduler reads it lock-free,
+	 * including for non-current tasks: a live task's slot is only freed
+	 * by its own exit, and the backing page is released only at mm
+	 * teardown, so a lock-free read always dereferences valid memory.
+	 * NULL = this thread has not registered a hint.
+	 */
 	struct sched_hint		*sched_hint_kaddr;
-	struct page			*sched_hint_page;
+	/* Slot index within the mm-wide hint area, or -1 if none. */
+	int				sched_hint_slot;
 #endif
 
 	/* CPU-specific state of this task: */
