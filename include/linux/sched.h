@@ -1638,7 +1638,7 @@ struct task_struct {
 #ifdef CONFIG_SCHED_HINT
 	/*
 	 * Kernel-side pointer to this thread's slot in the kernel-owned hint
-	 * pages: page_address(area->pages[slot / SLOTS_PER_PAGE]) +
+	 * pages: page_address(seg->pages[slot / SLOTS_PER_PAGE]) +
 	 * (slot % SLOTS_PER_PAGE) * SCHED_HINT_SLOT_SIZE.
 	 *
 	 * Valid for the lifetime of THIS thread: stored once at registration
@@ -1651,7 +1651,13 @@ struct task_struct {
 	 * NULL = this thread has not registered a hint.
 	 */
 	struct sched_hint		*sched_hint_kaddr;
-	/* Slot index within the mm-wide hint area, or -1 if none. */
+	/*
+	 * The segment owning this thread's slot, and the in-segment slot
+	 * index. Segments never move or free before mm teardown, so the
+	 * pointer stays valid and exit returns the slot without any global
+	 * index lookup. NULL segment / negative slot = not registered.
+	 */
+	struct sched_hint_segment	*sched_hint_seg;
 	int				sched_hint_slot;
 #endif
 

@@ -35,19 +35,39 @@
   - 依据：省内存 + 同进程线程 hint 挤在同几页 → 调度器批量读多个任务 hint 时缓存友好。
   - 注意：**没有「进程内稠密线程序号」这种东西**（tid 全局稀疏、会回收），必须用位图分配器；
     位图还比「tid 递进」更省（退出的槽立即复用，无空洞）。
-- **预留一个大 VMA，物理页全惰性**。上限锚定内核既有常量而非经验值：
-  64 位 `FUTEX_TID_MASK`（0x3fffffff ≈ 2^30 槽，64GiB VA）；32 位 `PID_MAX_LIMIT * 32`（2^20 槽，64MiB VA）。
-  - 依据：`FUTEX_TID_MASK` 是 futex 字 TID 域宽度，**高于内核可能发出的任何 TID**，
-    故高于任何单进程线程总数，即「一个进程把系统上限的线程全建了」也覆盖；
-    64GiB VA 在 64 位（128TiB 用户空间）里免费。
-  - 32 位用户空间仅 ~3GiB，装不下 64GiB，故钳到 `PID_MAX_LIMIT * 32`（= 64MiB，仍 32 倍于 pid 上限）。
-  - **per-mm 元数据（位图 + pages[]）绝不按 MAX_SLOTS 一次性分配**（2^30 槽 → 128MiB/进程，
-    几千个活跃进程就是几十上百 GiB，不可接受）：初始仅一页槽位的量（几十字节），
-    随注册线程数**翻倍增长**（`kvrealloc`，`area->lock` 下）。典型进程（百级线程）元数据 ~1KiB 量级。
-  - **预留必须足够大的真正理由**：避免运行期扩 VMA 导致**已发给用户的地址搬迁失效**。
-    不是为了省页表。
-  - **不要用 `threads-max` 当预留依据**：它是可写 sysctl，运行期会变。锚定 `FUTEX_TID_MASK`/
-    `PID_MAX_LIMIT` 这种编译期常量。
+- **多段（segment）VMA，按需增长，取代「单个大预留 VMA」**（本次讨论纠正的关键点）。
+  - **为什么放弃单大 VMA**：`_install_special_mapping` → `__install_special_mapping` 无条件
+    `vm_stat_account(len >> PAGE_SHIFT)`，即预留长度**全额计入 `mm->total_vm`**（`top` 的 VIRT）；
+    且本 VMA flags 恰好命中 `is_data_mapping`（`(flags & (VM_WRITE|VM_SHARED|VM_STACK)) == VM_WRITE`）
+    → **同时计入 `mm->data_vm`**。于是 `may_expand_vm` 会拿这 64GiB 去撞 `RLIMIT_AS` **和** `RLIMIT_DATA`
+    （mm/mmap.c:1337-1355）。容器/systemd 常把 `RLIMIT_AS` 设到 1-2GiB → **一注册就 mmap 失败**。
+    这不是审美问题（VIRT 难看），是真实功能 bug。旧 hint.h 那句「this only costs address space」是错的。
+  - **多段方案**：首段 1 页，每追加一段页数**翻倍**（1→2→4→…），封顶 `SCHED_HINT_SEG_MAX_PAGES`(512 页/2MiB)。
+    段数分两段函数（4K 页、64 槽/页）：**翻倍阶段** 1,2,…,512 页共 **10 段**，累计 1023 页 = 65472 槽，
+    覆盖绝大多数进程（含数万线程的重型服务）→ 段数 ⌈log₂⌉ 级、**≤10 段**，多数进程仅 **1 段**
+    （VIRT 仅 +4KiB，几乎不可见，RLIMIT 增量可忽略）。**封顶后线性阶段**：每段固定 512 页 = 32768 槽，
+    段数随线程数**线性**增长（每 32768 线程 +1 段）。极端的 `PID_MAX_LIMIT`(4M 线程) ≈ (4194304−65472)/32768
+    + 10 ≈ **136 段**——对真有 400 万线程的进程可忽略（光 task_struct 就 400 万个，maps 多 136 行不算什么）。
+    注意：段数**不是**全程对数级，只在前 65472 槽是对数级，之后线性；封顶把「每段 VA 请求有上界」换成
+    「病态规模下段数线性增长」，是有意的权衡。
+  - **单段封顶的理由**：无限翻倍会让极端进程的最后一段要求 GiB 级**连续** VA，`get_unmapped_area` 可能失败；
+    封顶后每次 `get_unmapped_area` 最多请求 2MiB，稳。
+  - **「旧地址不失效」如何保住**：段一旦创建**永不移动、永不缩小、永不释放**（直到 `__mmput`）；
+    增长 = 在新的 VA 装一个**新段**，绝不动已有段。已通过 prctl 回填给用户的 `uaddr`/缓存的 `kaddr`
+    天然全部有效。（对比：单段原地 `mremap` 扩容会搬迁 → 已发地址失效；靠「恰好有相邻空闲 VA」不保证 →
+    单段扩容方案被否。）
+  - **每段元数据（`pages[]` + `slot_bitmap`）在建段时按段大小一次性定长分配**，不再需要
+    `kvrealloc` 翻倍 + 尾部 memset。增长从「重分配数组」变成「追加段」，那块反复打磨的数组增长逻辑整个消失。
+  - **slot 标识改为 (段指针, 段内 slot 号)**，不用全局 slot 号。task_struct 直接存**段指针**（段永不释放，
+    指针恒稳）：释放路径 O(1)，无需「全局号→段」反查；分配时也不必从全局号反算段内 offset。
+  - **soft 上限 `SCHED_HINT_MAX_SLOTS` = `PID_MAX_LIMIT`**（64 位 4M / 32 位 32768），降级为 sanity 断言
+    （`WARN_ON_ONCE` 防分配器逻辑 bug），不再用于预留 VA。真实容量由内存和线程数自然封顶。
+    **锚 `PID_MAX_LIMIT` 而非 `FUTEX_TID_MASK` 的理由**：每线程至多用一个 slot，"能同时存在多少线程"由 pid
+    分配器钳在 `PID_MAX_LIMIT`——这才是并发 slot 数的真上限；`FUTEX_TID_MASK`(~10 亿)是 futex 字里 TID
+    字段的**位宽**（一个 TID 值最大能取到多少），不是活线程**个数**，用它是概念错位（本轮纠正）。
+    编译期改钉 `static_assert(SCHED_HINT_SEG_MAX_PAGES <= ~0UL >> PAGE_SHIFT)`（单段 VMA 长度不溢出）。
+  - **额外收益：隔离性更好**。32 位未 seal 时，某线程 munmap 只毁掉它落在的那一段（影响该段上的线程），
+    不再是单个巨型 VMA 一发入魂拆掉全进程调度能力。
 - **内核只读 hint，用户全权写**。移除内核回写用户页的能力。
   - 影响：删除 `scx_bpf_clear_sched_hint` kfunc。与「hint 尽量 level-triggered、当前值即真相」方向一致。
 - **必须支持读「非 current 任务」的 hint**（wakeup/select_cpu 看目标任务 p）。
@@ -90,47 +110,56 @@ h->exec_dense = SCHED_EXEC_INT;          /* 直接写自己那 64 字节 */
 
 ### 数据结构
 ```c
-/* mm_struct 里，替换现有 sched_hint_offset / has_sched_hint */
-struct sched_hint_area {
-    unsigned long   uaddr_base;     /* 预留 VMA 的用户态基址 */
-    struct page   **pages;          /* 按需扩容（翻倍），pages[i]==NULL 表示未分配 */
-    unsigned long  *slot_bitmap;    /* 按需扩容（翻倍）；占用位图，密排复用 */
-    unsigned long   capacity_slots; /* 元数据当前容量（slot 数），< SCHED_HINT_MAX_SLOTS */
+/* 一个按需增长的段：一段预留 VMA + 背后的内核页。段建后永不移动/缩小/释放（直到 __mmput）。 */
+struct sched_hint_segment {
+    struct vm_special_mapping spec;  /* 内嵌：.fault 里 container_of 回到段，无需查表/加锁 */
+    unsigned long   uaddr_base;      /* 本段 VMA 用户态基址 */
+    unsigned long   nr_pages;        /* 本段页数（建段时定长）；slot 容量 = nr_pages*SLOTS_PER_PAGE，派生不另存 */
     unsigned long   nr_slots_used;
-    struct mutex    lock;
+    struct page   **pages;           /* [nr_pages]，pages[i]==NULL 表示未 alloc；建段时定长 */
+    unsigned long  *slot_bitmap;     /* [nr_pages*SLOTS_PER_PAGE bits]，密排复用；建段时定长 */
+    struct list_head node;
+};
+/* slot 容量用 sched_hint_seg_slots(seg) = seg->nr_pages*SLOTS_PER_PAGE 就地派生 */
+
+/* mm_struct 里 */
+struct sched_hint_area {
+    struct list_head segments;    /* struct sched_hint_segment，oldest first */
+    unsigned long    nr_segments;
+    unsigned long    total_slots; /* 各段 [nr_pages*SLOTS_PER_PAGE] 之和 */
+    struct mutex     lock;
 };
 struct sched_hint_area *sched_hint_area;  /* mm 里；NULL = 本进程未启用 */
 
-/* task_struct 里，替换现有 sched_hint_kaddr / sched_hint_page */
-struct sched_hint *sched_hint_kaddr;  /* = page_address(pages[slot/SLOTS_PER_PAGE])
-                                         + (slot%SLOTS_PER_PAGE)*SCHED_HINT_SLOT_SIZE */
-int                sched_hint_slot;   /* -1 = 无 */
+/* task_struct 里 */
+struct sched_hint         *sched_hint_kaddr; /* = page_address(seg->pages[slot/SLOTS_PER_PAGE])
+                                                + (slot%SLOTS_PER_PAGE)*SCHED_HINT_SLOT_SIZE */
+struct sched_hint_segment *sched_hint_seg;   /* 本线程 slot 所属段；NULL = 无 */
+int                        sched_hint_slot;  /* 段内 slot 号；-1 = 无 */
 ```
 常量：`SCHED_HINT_SLOT_SIZE = sizeof(struct sched_hint)`；`SLOTS_PER_PAGE = PAGE_SIZE/SCHED_HINT_SLOT_SIZE`；
-`SCHED_HINT_MAX_SLOTS`：64 位 `FUTEX_TID_MASK` / 32 位 `PID_MAX_LIMIT * 32`（见第 1 节）。
+`SCHED_HINT_SEG_FIRST_PAGES=1`、`SCHED_HINT_SEG_MAX_PAGES=512`；`SCHED_HINT_MAX_SLOTS`（sanity 断言用，见第 1 节）。
 
 ### 关键流程
-1. **首个注册线程**：分配 `sched_hint_area`，`get_unmapped_area` + `_install_special_mapping` 建
-   `SCHED_HINT_MAX_SLOTS*SCHED_HINT_SLOT_SIZE` 的特殊 VMA（`vm_special_mapping`：`.fault` 惰性填页、
-   `.close` **空转**；`special_mapping_vmops` 自带 `.may_split=-EINVAL` + `VM_DONTEXPAND`），
-   flags 打 `VM_SEALED | VM_DONTCOPY | VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE`，存 `uaddr_base`。
-2. **每次 prctl**：位图取空闲 slot `i`（容量内扫描，不够则翻倍扩容元数据 `kvrealloc`）→
-   若对应页空则 `alloc_page(__GFP_ZERO)` → **slot 交付时** memset 清 payload + 写 magic/version
-   （页比线程活得久，复用槽位必须清除前任标签；不采用「建页时写」，交付时初始化才能覆盖
-   页已被用户先 touch 过的场景）→ 算内核侧 `task->sched_hint_kaddr` 与用户侧
-   `uaddr = uaddr_base + i*SCHED_HINT_SLOT_SIZE` → `put_user(uaddr, arg2)`（**area->lock 外**，
-   见第 4 节自死锁风险）→ 记 `task->sched_hint_slot = i`；`put_user` 失败回滚 slot。
-3. **`.fault`**：只映射已注册 slot 的页（`pages[pgoff]` 非空）→ `get_page` + `vmf->page = page`
-   （special mapping 约定，核心 mm 负责插 PTE，用户 PTE 那份 `_refcount` 由核心加上）；
-   未注册区域 **SIGBUS**（vDSO 先例）。这同时把元数据增长绑定在实际注册量上——
-   否则用户单次访问预留区末尾就会强迫位图/pages[] 扩容到 ~256MiB（DoS）。
-4. **线程退出（`exit_mm` 之前、`task->mm` 仍持引用处）**：持 `area->lock` 归还 slot 到位图，
-   清 `task->sched_hint_kaddr/slot`；**不释放页**。安全性：还 slot 时该线程尚未 mmput，area 必然还在；
-   且该 task 即将 dead，调度器不会再读它的 kaddr → **还 slot 无需与调度器读同步**（只有位图位操作要锁）。
-5. **进程退出**：在 `__mmput` 里 `exit_mmap(mm)` **之后**调 `sched_hint_free_area(mm)`——
-   以 `mm->sched_hint_area` 为准，`put_page` 所有 `pages[]` + free 位图 + free area + 置 NULL，**只跑一次**。
-   放 `exit_mmap` 之后：此时用户 PTE 那份 refcount 已被 `exit_mmap` 掉，`put_page` 归零、页干净回 buddy。
-   **`.close` 不参与释放**（见第 1 节「释放点解耦」）。
+1. **首个注册线程**：分配 `sched_hint_area`（空段链表），暂不建任何 VMA。
+2. **每次 prctl（`mmap_write_lock` + `area->lock` 下）**：从**最老段**往新扫，找第一个有空位的段取 slot；
+   全满则**追加一段**（`sched_hint_next_seg_pages` 定页数：首段 1 页、否则上一段 ×2 封顶 512 页
+   → `get_unmapped_area` + `_install_special_mapping` 装 VMA，flags
+   `VM_SEALED | VM_DONTCOPY | VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE`；段内嵌 `spec`：
+   `.fault` 惰性填页 / `.mremap` 返 -EINVAL / `.close` 留 NULL）。取到 slot 后：若对应页空则
+   `alloc_page(__GFP_ZERO)` 并 `WRITE_ONCE(seg->pages[i], page)`（对无锁 fault 发布）→ **slot 交付时**
+   memset 清 payload + 写 magic/version（页比线程活得久，复用槽位必须清前任标签）→ 算 `kaddr` 与
+   `uaddr = seg->uaddr_base + slot*SLOT_SIZE` → `put_user(uaddr, arg2)`（**两把锁都放掉之后**，见第 4 节）→
+   记 `task->{sched_hint_seg, sched_hint_slot}` + `WRITE_ONCE(kaddr)`；`put_user` 失败回滚 slot。
+   - 密排复用**跨段**：某段里线程退出留下的空洞会被后续注册优先填掉（先扫老段），页占用不会白涨。
+3. **`.fault`（无锁）**：`container_of(sm, seg, spec)` 拿到段 → `pgoff < seg->nr_pages` 且
+   `READ_ONCE(seg->pages[pgoff])` 非空 → `get_page` + `vmf->page = page`（核心 mm 插 PTE，用户 PTE 那份
+   `_refcount` 由核心加）；否则 **SIGBUS**。不碰 `area->lock`、不依赖 `mm->sched_hint_area`。
+4. **线程退出（`exit_mm` 之前、`task->mm` 仍持引用处）**：持 `area->lock`，用 `task->sched_hint_seg`
+   直接归还 slot 到该段位图（O(1)，无全局号反查），清 `task->{kaddr,seg,slot}`；**不释放页/段**。
+5. **进程退出**：`__mmput` 里 `exit_mmap(mm)` **之后**调 `sched_hint_free_area(mm)`——遍历段链表，逐段
+   `put_page` 所有 `pages[]` + free 位图 + free 段结构，最后 free area + 置 NULL，**只跑一次**。
+   段结构须活到此刻（VMA 持有其内嵌 `spec` 指针）。**`.close` 不参与释放**（见第 1 节「释放点解耦」）。
 6. **跨任务读**：`p->sched_hint_kaddr`（判 NULL 后）直接读，`p != current` 成立。读侧不加锁。
 
 ## 3. 分阶段任务清单（TODO）
@@ -138,30 +167,37 @@ int                sched_hint_slot;   /* -1 = 无 */
 > 环境注意：本开发环境**不能 boot 内核**，只能逐文件编译检查（`.config` 在，可 `make kernel/sched/hint.o` 等）。
 > 用户（YaQia）会在自己笔记本上 boot 实测。建议先把内核骨架编译稳定，再动用户态 Pass。
 
-### 阶段 A：内核数据结构与分配器 ✅
+### 阶段 A：内核数据结构与分配器 ✅（多段模型）
 - [x] 常量放内核内部头（未动 uapi，struct sched_hint 本身不变）：
-      `include/linux/sched/hint.h` 定义 `SCHED_HINT_SLOT_SIZE/SLOTS_PER_PAGE/SCHED_HINT_MAX_SLOTS`
-      （64 位锚 `FUTEX_TID_MASK`，32 位钳 `PID_MAX_LIMIT*32`）、`struct sched_hint_area`、
+      `include/linux/sched/hint.h` 定义 `SCHED_HINT_SLOT_SIZE/SLOTS_PER_PAGE`、
+      `SCHED_HINT_SEG_FIRST_PAGES=1`/`SCHED_HINT_SEG_MAX_PAGES=512`、
+      `SCHED_HINT_MAX_SLOTS`（sanity 断言用，= `PID_MAX_LIMIT`，不再区分架构/不再锚 `FUTEX_TID_MASK`）、
+      `struct sched_hint_segment`（内嵌 `vm_special_mapping`）、`struct sched_hint_area`（段链表）、
       三个函数原型（`set_sched_hint_prctl`/`sched_hint_exit_task`/`sched_hint_free_area`）。
-- [x] `include/linux/mm_types.h`：`sched_hint_offset`/`has_sched_hint` → `struct sched_hint_area *`。
-- [x] `include/linux/sched.h`：`sched_hint_page` → `int sched_hint_slot`（-1=无），保留 `sched_hint_kaddr`。
-- [x] `kernel/sched/hint.c`：area 创建、位图翻倍扩容（`kvrealloc` + **显式 memset 尾部**，本树 krealloc/
-      vrealloc 对新增尾部清零语义不一致）、slot alloc/free、内核页惰性 alloc、kaddr 计算、
-      magic/version **slot 交付时**写。VMA 长度溢出有 `static_assert` 编译期保证。
+- [x] `include/linux/mm_types.h`：`sched_hint_offset`/`has_sched_hint` → `struct sched_hint_area *`（段链表）。
+- [x] `include/linux/sched.h`：task 存 `sched_hint_kaddr` + `struct sched_hint_segment *sched_hint_seg`
+      + `int sched_hint_slot`（段内号，-1=无）。
+- [x] `kernel/sched/hint.c`：area 创建（空段链表）、段建（`get_unmapped_area`+`_install_special_mapping`，
+      页数指数增长封顶）、每段 `pages[]`/`slot_bitmap` 建段时定长分配、跨段密排 slot alloc/free、
+      内核页惰性 `alloc_page`（`WRITE_ONCE` 发布）、kaddr 计算、magic/version **slot 交付时**写。
+      单段 VMA 长度溢出有 `static_assert(SCHED_HINT_SEG_MAX_PAGES <= ~0UL >> PAGE_SHIFT)` 保证。
+      **无 `kvrealloc` 数组翻倍**（多段模型下每段定长，不再需要）。checkpatch 0/0、`W=1` 编译干净。
 
 ### 阶段 B：prctl 接口（hint.c 部分完成；uapi/sys.c 未动）
 - [ ] `include/uapi/linux/prctl.h`：`PR_SET_SCHED_HINT_OFFSET` → `PR_SET_SCHED_HINT`（值 83）。
 - [ ] `kernel/sys.c`：dispatch 改名，调用新签名（当前 sys.c 还是旧三参数调用，**树暂不可整编**）。
 - [x] `kernel/sched/hint.c` `set_sched_hint_prctl(task, uptr)`：`mmap_write_lock_killable` 下
-      check-and-create area+VMA（首次注册竞争串行化）；分配 slot；`put_user` 在 **area->lock 外**
-      （自死锁规避）；EFAULT 回滚 slot；重复调用幂等（回填同一地址）；compat 拒绝 `-EOPNOTSUPP`。
+      check-and-create area（首次注册竞争串行化），`area->lock` 下跨段分配 slot（满则追加段、建 VMA）；
+      `put_user` 在 **两把锁都放掉之后**（自死锁规避）；EFAULT 回滚 slot；重复调用幂等（回填同一地址，
+      经 `task->sched_hint_seg`）；compat 拒绝 `-EOPNOTSUPP`。
 
-### 阶段 C：VMA 与惰性映射 ✅
+### 阶段 C：VMA 与惰性映射 ✅（每段一个 VMA）
 - [x] 采用 `vm_special_mapping` + `_install_special_mapping`（评估点已解决：接受任意 vm_flags，
       可叠 `VM_SEALED`；x86 vDSO 同款调用模式）。`special_mapping_vmops` 自带
-      `.may_split=-EINVAL` + `VM_DONTEXPAND` + 防 VMA merge。`.fault` 用 `get_page`+`vmf->page`
-      （不用 `vm_insert_page`）。`sm->close` 留 NULL（special_mapping_close 判空跳过 = 空转），
-      释放唯一在 `__mmput`。`sm->mremap` 返回 `-EINVAL`。
+      `.may_split=-EINVAL` + `VM_DONTEXPAND` + 防 VMA merge。**每段一个 VMA**，`vm_private_data` 指向
+      段内嵌的 `spec`；`.fault` 经 `container_of` 回到段、**无锁**读 `READ_ONCE(seg->pages[pgoff])`，
+      `get_page`+`vmf->page`（不用 `vm_insert_page`）。`sm->close` 留 NULL（special_mapping_close
+      判空跳过 = 空转），释放唯一在 `__mmput`。`sm->mremap` 返回 `-EINVAL`。
 - [x] flags：`VM_SEALED | VM_DONTCOPY | VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE`
       （`VM_DONTEXPAND` 由 `__install_special_mapping` 自动补）。
       64 位 mseal 拦截免费生效；32 位 `VM_SEALED==VM_NONE` no-op，靠 refcount 兜底。
@@ -173,19 +209,23 @@ int                sched_hint_slot;   /* -1 = 无 */
 - [ ] **DF1**：`mm_init()`（约 `kernel/fork.c:1079`）无条件 `mm->sched_hint_area = NULL;`。
       fresh mm 和 dup mm 都过这里；否则子 mm 浅拷贝父 area 指针 → teardown 双重释放 + slot 位图打架。
 - [ ] **DF2（最关键）**：`dup_task_struct()`（约 `kernel/fork.c:952`，`seccomp.filter = NULL` 那一带）显式
-      `tsk->sched_hint_kaddr = NULL; tsk->sched_hint_slot = -1;`。否则子线程继承父 slot → 退出时释放父的 slot。
+      `tsk->sched_hint_kaddr = NULL; tsk->sched_hint_seg = NULL; tsk->sched_hint_slot = -1;`。
+      否则子线程继承父 seg/slot → 退出时释放父的 slot。
 - [ ] **UAF2**：`fs/exec.c` `begin_new_exec()`（:1091）在 `exec_mmap()`（:1148）**之前**清
-      `current->sched_hint_kaddr = NULL; current->sched_hint_slot = -1;`。exec 换 mm 后旧 area 被 `__mmput` 释放，
-      存活的 exec 线程 task 不变、kaddr 会悬挂。放 exec_mmap 之前是不给调度器留读悬挂指针的窗口。
+      `current->sched_hint_kaddr = NULL; current->sched_hint_seg = NULL; current->sched_hint_slot = -1;`。
+      exec 换 mm 后旧 area 被 `__mmput` 释放，存活的 exec 线程 task 不变、kaddr/seg 会悬挂。
+      放 exec_mmap 之前是不给调度器留读悬挂指针的窗口。
 - [ ] **删除旧 pin 代码**：`kernel/fork.c:558-562`（free_task 的 unpin 段）、
       `kernel/fork.c:2244-2274`（copy_thread 后的 clone-pin 段）。
 - [ ] **free_task 不还 slot**：`free_task` 时 `task->mm` 已 NULL、area 可能已被 `__mmput` 释放，
       在此还 slot 会写已释放的 bitmap → UAF。`free_task` 对 hint 只做空操作（可 `WARN_ON_ONCE(kaddr)` 断言）。
 - [ ] **还 slot 放对位置**：`kernel/exit.c` `do_exit`/`exit_mm` 中、`exit_mm()` 之前（`task->mm` 仍持引用处），
-      新增 `sched_hint_exit_task(current)`：持 `area->lock` 清位图 bit + 清本 task kaddr/slot。
+      新增 `sched_hint_exit_task(current)`：经 `task->sched_hint_seg` 持 `area->lock` 清段位图 bit + 清本 task
+      kaddr/seg/slot。
 - [ ] **释放 area（唯一真源）**：`kernel/fork.c:1174` `__mmput` 里、`exit_mmap(mm)` **之后**调
-      `sched_hint_free_area(mm)`：以 `mm->sched_hint_area` 为准，`put_page` 所有 pages + free bitmap + free area + 置 NULL。
-      只跑一次。**与 `.close` 职责划分**：`.close` 空转，释放只在这里，从根上杜绝 double-free 和 32 位 munmap-UAF。
+      `sched_hint_free_area(mm)`：遍历段链表逐段 `put_page` 所有 pages + free 位图 + free 段结构，最后 free area
+      + 置 NULL。只跑一次。段结构须活到此刻（VMA 持有其内嵌 `spec` 指针）。**与 `.close` 职责划分**：
+      `.close` 空转，释放只在这里，从根上杜绝 double-free 和 32 位 munmap-UAF。
 - [ ] **prctl 错误路径**：若 area 已建但后续步骤失败，就地释放 area 并把 `mm->sched_hint_area` 置回 NULL。
 
 ### 阶段 E：sched_ext / BPF 侧
@@ -217,28 +257,30 @@ int                sched_hint_slot;   /* -1 = 无 */
 - **`install_special_mapping` vs 自定义 `.mmap`（已定论）**：采用 `_install_special_mapping`，
   接受任意 vm_flags（可叠 `VM_SEALED`，x86 vDSO 同款），自带 `.may_split=-EINVAL`/`VM_DONTEXPAND`/防 merge。
 - **`.close` 与 mm 销毁的清理职责划分（已定论）**：`.close` **一律空转、绝不 put_page**；
-  area/pages/bitmap 释放**只**在 `__mmput`（`exit_mmap` 之后）`sched_hint_free_area` 一处做一次。
+  段/pages/bitmap/area 释放**只**在 `__mmput`（`exit_mmap` 之后）`sched_hint_free_area` 一处遍历段链表做一次。
   理由：`.close` 是逐-VMA 回调，32 位未 seal 时 munmap 会中途触发它，若在此 put_page → 存活线程 kaddr 悬挂 UAF，
   且与 refcount 兜底矛盾。把释放解耦到「mm 消失」这一唯一时刻，32/64 位一套代码、无 double-free、无 UAF。
-- **refcount 兜底原理**：页有两份 `_refcount`——`area->pages[i]`（内核持有）+ 用户 PTE 一份
+- **refcount 兜底原理**：页有两份 `_refcount`——`seg->pages[i]`（内核持有）+ 用户 PTE 一份
   （`.fault` 经 `get_page`+`vmf->page` 由核心 mm 加）。
-  用户 munmap 只掉 PTE 那份，`area->pages[i]` 那份仍在 → 页不进回收 → `page_address()` 算的 kaddr 永久有效。
+  用户 munmap 只掉 PTE 那份，`seg->pages[i]` 那份仍在 → 页不进回收 → `page_address()` 算的 kaddr 永久有效。
   这是新模型对 pin 方案的根本升级：内核拥有**自己的页**，用户页表只是其视图；撤视图不动数据源。
 - **`VM_SEALED` 与释放正交**：seal 只决定「用户能否中途拆 VMA」（64 位不能/32 位能），
   释放点始终是 `__mmput`，与 seal 无关。别把两者耦合（本次讨论纠正的关键教训）。
-- **put_user 必须在 area->lock 外（已实现）**：put_user 可能缺页，缺页可能恰好由 sched_hint VMA 的
-  `.fault` 服务（用户把回填目标指进了预留区），`.fault` 要拿 `area->lock` → 锁内 put_user 会自死锁。
-- **首次注册竞争（已实现）**：两个线程同时首次 prctl → `mmap_write_lock_killable` 下
-  check-and-create，天然串行化；slot 分配只需 `area->lock`。
-- **kvrealloc 尾部清零（已实现）**：本树 `kvrealloc` 已是三参数新 API（`p, new_size, flags`），
-  krealloc/vrealloc 两条路径对「新增尾部」的清零语义不一致 → 扩容后**显式 memset 尾部**，
-  不依赖 `__GFP_ZERO`。
-- **VMA 长度溢出（已实现）**：`static_assert(SCHED_HINT_MAX_SLOTS <= ~0UL / SCHED_HINT_SLOT_SIZE)`
-  编译期钉死：64 位 0x3fffffff*64 ≈ 64GiB，32 位 2^20*64 = 64MiB，均不溢出 `unsigned long`。
-- **并发**：`sched_hint_area->lock`（mutex）保护 slot 位图、pages[] 及其**按需翻倍扩容**（`kvrealloc` 会搬迁数组，
-  但 `task->sched_hint_kaddr` 在注册时算好存进 task_struct、**从不回读数组**，故扩容不影响任何活线程，读侧也不依赖数组地址）；
-  prctl 上下文可睡眠，但调度器读 `sched_hint_kaddr` 在原子上下文——**读侧不加锁**，依据是
-  「kaddr 在线程生命周期内不被 area 维护修改、页在该线程存活期间不释放」。
+- **put_user 必须在锁外（已实现）**：put_user 可能缺页，缺页可能恰好由某段 sched_hint VMA 的
+  `.fault` 服务（用户把回填目标指进了预留区）；且 slot 分配路径持 `mmap_write_lock`，而缺页要拿
+  mmap_lock → 锁内 put_user 会自死锁。故 `put_user` 放在 `area->lock` **和** `mmap_write_lock` 都释放之后。
+- **首次注册 / 段追加竞争（已实现）**：首次 prctl 建 area 在 `mmap_write_lock_killable` 下 check-and-create
+  串行化；段追加要装 VMA，必须持 `mmap_write_lock` → slot 分配整段在 `mmap_write_lock` + `area->lock`
+  下进行（比旧单 VMA 模型多拿 mmap_write_lock，但段追加是罕见事件：每 1/2/4…512 页一次，可接受）。
+- **段几何与 VMA 长度溢出（已实现）**：段页数 1→2→4…封顶 `SCHED_HINT_SEG_MAX_PAGES`(512)；
+  `static_assert(SCHED_HINT_SEG_MAX_PAGES <= ~0UL >> PAGE_SHIFT)` 编译期钉死单段 VMA 长度不溢出。
+  `SCHED_HINT_MAX_SLOTS` 仅在段追加时作 `WARN_ON_ONCE` sanity（防分配器逻辑 bug），不参与预留。
+  **每段 `pages[]`/`slot_bitmap` 建段时按段大小定长分配**，无 `kvrealloc` 翻倍、无尾部 memset。
+- **并发**：`sched_hint_area->lock`（mutex）保护段链表及每段的位图/pages[]/计数。段一旦建成其 `pages[]`
+  数组指针**永不搬迁**（定长），`seg->pages[i]` 元素由 `WRITE_ONCE` 发布、`.fault` 侧 `READ_ONCE` 读，
+  fault 全程**不碰 `area->lock`**（经 `container_of` 直达段）。`task->sched_hint_kaddr` 注册时算好存 task、
+  **从不回读段数组**，故段增长/追加不影响任何活线程；prctl 上下文可睡眠，调度器读 `sched_hint_kaddr`
+  在原子上下文——**读侧不加锁**，依据是「kaddr 在线程生命周期内不被 area 维护修改、页在该线程存活期间不释放」。
 - **还 slot 无需与调度器读同步（已澄清）**：还 slot 只清位图一个 bit；被还的 task 即将 dead，
   调度器不会再通过 `p->sched_hint_kaddr` 读它 → 无争用。slot 被新线程复用时是**另一个 task_struct**，
   指针绑 task、老 task 死了没人读，不会「读到上一租户残留」。锁只护位图位操作，读路径完全不碰锁。
@@ -248,9 +290,10 @@ int                sched_hint_slot;   /* -1 = 无 */
 - **跨任务读的内存序**：`p->sched_hint_kaddr` 设置（prctl）与调度器读之间，靠常规发布语义；
   内核自有页内容由用户写、内核读，仍是 best-effort，无需 barrier（与原设计一致）。
   **访问标注规则**：`sched_hint_kaddr` 有跨 CPU 无锁读者（调度器读非 current 任务）→ 其**所有写点**
-  （prctl 发布、exit/exec 清除）统一 `WRITE_ONCE`；`sched_hint_slot` 无任何跨任务读者（仅本任务
-  prctl/exit/exec 及 fork 写未运行的 child）→ 全部普通访问。同一位置禁止混用标注/裸访问（KCSAN）。
-  若将来 BPF 需要读 `p->sched_hint_slot`（当前设计不需要），须将 slot 全访问点迁移到 READ_ONCE/WRITE_ONCE。
+  （prctl 发布、exit/exec 清除）统一 `WRITE_ONCE`；`sched_hint_seg`/`sched_hint_slot` 无任何跨任务读者
+  （仅本任务 prctl/exit/exec 及 fork 写未运行的 child）→ 全部普通访问。同一位置禁止混用标注/裸访问（KCSAN）。
+  另外 `seg->pages[i]` 有无锁 `.fault` 读者 → 发布用 `WRITE_ONCE`、fault 侧 `READ_ONCE`。
+  若将来 BPF 需要读 `p->sched_hint_seg/slot`（当前设计不需要），须将其全访问点迁移到 READ_ONCE/WRITE_ONCE。
 - **magic/version**：**slot 交付时**写入（页比线程活得久，复用槽位必须清前任标签，交付时初始化
   才能覆盖页被用户先 touch 过的场景）；用户不应改 magic。跨任务读时可选择校验 magic（已在内核控制下，可省）。
 - **PAGE_SIZE 非 4K 架构**：`SLOTS_PER_PAGE = PAGE_SIZE / SCHED_HINT_SLOT_SIZE` 自动适配
