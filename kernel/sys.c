@@ -2905,10 +2905,10 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = arch_lock_indir_br_lp_status(me, arg2);
 		break;
 #ifdef CONFIG_SCHED_HINT
-	case PR_SET_SCHED_HINT_OFFSET:
-		if (arg4 || arg5)
+	case PR_SET_SCHED_HINT:
+		if (arg3 || arg4 || arg5)
 			return -EINVAL;
-		error = set_sched_hint_prctl(me, arg2, arg3);
+		error = set_sched_hint_prctl(me, arg2);
 		break;
 #endif
 	default:

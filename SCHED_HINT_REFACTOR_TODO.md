@@ -183,9 +183,10 @@ int                        sched_hint_slot;  /* 段内 slot 号；-1 = 无 */
       单段 VMA 长度溢出有 `static_assert(SCHED_HINT_SEG_MAX_PAGES <= ~0UL >> PAGE_SHIFT)` 保证。
       **无 `kvrealloc` 数组翻倍**（多段模型下每段定长，不再需要）。checkpatch 0/0、`W=1` 编译干净。
 
-### 阶段 B：prctl 接口（hint.c 部分完成；uapi/sys.c 未动）
-- [ ] `include/uapi/linux/prctl.h`：`PR_SET_SCHED_HINT_OFFSET` → `PR_SET_SCHED_HINT`（值 83）。
-- [ ] `kernel/sys.c`：dispatch 改名，调用新签名（当前 sys.c 还是旧三参数调用，**树暂不可整编**）。
+### 阶段 B：prctl 接口 ✅
+- [x] `include/uapi/linux/prctl.h`：`PR_SET_SCHED_HINT_OFFSET` → `PR_SET_SCHED_HINT`（值 83）。
+- [x] `kernel/sys.c`：dispatch 改名，调用新双参签名，`arg3/4/5` 非零返回 `-EINVAL`
+      （整树编译仍待阶段 D 清理 fork.c 旧 pin 代码）。
 - [x] `kernel/sched/hint.c` `set_sched_hint_prctl(task, uptr)`：`mmap_write_lock_killable` 下
       check-and-create area（首次注册竞争串行化），`area->lock` 下跨段分配 slot（满则追加段、建 VMA）；
       `put_user` 在 **两把锁都放掉之后**（自死锁规避）；EFAULT 回滚 slot；重复调用幂等（回填同一地址，

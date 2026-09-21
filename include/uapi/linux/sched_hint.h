@@ -12,13 +12,15 @@
  *   - the LLVM pass   (same, on the compiler's header search path)
  *   - BPF schedulers  (through BTF / vmlinux.h; do NOT include this header)
  *
- * One instance lives per THREAD (TLS). Userspace registers it once via
- * prctl(PR_SET_SCHED_HINT_OFFSET, ...); the kernel then reads it lazily at
+ * One instance lives per THREAD, in a slot of a kernel-owned page mapped
+ * into the process. Each thread calls prctl(PR_SET_SCHED_HINT, &ptr, 0, 0, 0)
+ * once; the kernel registers it, back-fills ptr with its slot address, and
+ * reads it lazily at
  * scheduling hooks. Every write is a plain store — non-zero payload = active.
  *
  * ABI is NOT yet stable (prototype phase): the layout may change, but when it
  * does it changes HERE, in one place. Bump SCHED_HINT_VERSION on any change;
- * the prctl path rejects a mismatched version at registration time.
+ * the kernel stamps magic/version into each slot when handing it out.
  */
 
 #include <linux/types.h>
@@ -109,7 +111,7 @@ enum sched_hint_dep_role {
  * struct sched_hint (64 bytes total)
  *
  *   [0..3]    magic          SCHED_HINT_MAGIC
- *   [4..7]    version        SCHED_HINT_VERSION (checked at prctl)
+ *   [4..7]    version        SCHED_HINT_VERSION (stamped at slot delivery)
  *
  *   Tag payloads (non-zero = active):
  *   [8]       exec_dense     SCHED_EXEC_xxx bitmask
