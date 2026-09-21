@@ -137,7 +137,7 @@ sched_hint_seg_create(struct mm_struct *mm, struct sched_hint_area *area)
 	unsigned long addr;
 	int ret;
 
-	if (WARN_ON_ONCE(area->total_slots > SCHED_HINT_MAX_SLOTS - nr_slots)) {
+	if (WARN_ON_ONCE(area->total_slots + nr_slots > SCHED_HINT_MAX_SLOTS)) {
 		ret = -ENOSPC;
 		goto err_ret;
 	}
@@ -374,9 +374,10 @@ void sched_hint_exit_task(struct task_struct *t)
 
 	/*
 	 * Runs in the task's own exit/exec path, before its mm reference is
-	 * dropped, so mm->sched_hint_area is still valid.
+	 * dropped, so mm->sched_hint_area is still valid. If the mm is
+	 * already gone the call site is misplaced: warn and leak the slot.
 	 */
-	area = t->mm->sched_hint_area;
+	area = t->mm ? t->mm->sched_hint_area : NULL;
 	t->sched_hint_seg = NULL;
 	t->sched_hint_slot = -1;
 	WRITE_ONCE(t->sched_hint_kaddr, NULL);
