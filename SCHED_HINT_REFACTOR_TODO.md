@@ -204,30 +204,26 @@ int                        sched_hint_slot;  /* 段内 slot 号；-1 = 无 */
       64 位 mseal 拦截免费生效；32 位 `VM_SEALED==VM_NONE` no-op，靠 refcount 兜底。
 - [x] `.fault` 只映射已注册 slot 的页、其余 SIGBUS（决策与理由见第 2 节流程 3）。
 
-### 阶段 D：fork / exit 清理（DF/UAF 向量逐条处理）
+### 阶段 D：fork / exit 清理 ✅（DF/UAF 向量逐条处理）
 > 根因：`dup_task_struct`/`dup_mm` 是结构体**浅拷贝**，会把 hint 指针/slot 原样复制给子 task/子 mm。
 > 新模型无 pin refcount 兜底，每处必须显式清。三大杀手：DF1（共享 area 指针）、DF2（继承 slot）、UAF2（exec 换 mm）。
-- [ ] **DF1**：`mm_init()`（约 `kernel/fork.c:1079`）无条件 `mm->sched_hint_area = NULL;`。
-      fresh mm 和 dup mm 都过这里；否则子 mm 浅拷贝父 area 指针 → teardown 双重释放 + slot 位图打架。
-- [ ] **DF2（最关键）**：`dup_task_struct()`（约 `kernel/fork.c:952`，`seccomp.filter = NULL` 那一带）显式
-      `tsk->sched_hint_kaddr = NULL; tsk->sched_hint_seg = NULL; tsk->sched_hint_slot = -1;`。
-      否则子线程继承父 seg/slot → 退出时释放父的 slot。
-- [ ] **UAF2**：`fs/exec.c` `begin_new_exec()`（:1091）在 `exec_mmap()`（:1148）**之前**清
-      `current->sched_hint_kaddr = NULL; current->sched_hint_seg = NULL; current->sched_hint_slot = -1;`。
-      exec 换 mm 后旧 area 被 `__mmput` 释放，存活的 exec 线程 task 不变、kaddr/seg 会悬挂。
-      放 exec_mmap 之前是不给调度器留读悬挂指针的窗口。
-- [ ] **删除旧 pin 代码**：`kernel/fork.c:558-562`（free_task 的 unpin 段）、
-      `kernel/fork.c:2244-2274`（copy_thread 后的 clone-pin 段）。
-- [ ] **free_task 不还 slot**：`free_task` 时 `task->mm` 已 NULL、area 可能已被 `__mmput` 释放，
-      在此还 slot 会写已释放的 bitmap → UAF。`free_task` 对 hint 只做空操作（可 `WARN_ON_ONCE(kaddr)` 断言）。
-- [ ] **还 slot 放对位置**：`kernel/exit.c` `do_exit`/`exit_mm` 中、`exit_mm()` 之前（`task->mm` 仍持引用处），
-      新增 `sched_hint_exit_task(current)`：经 `task->sched_hint_seg` 持 `area->lock` 清段位图 bit + 清本 task
-      kaddr/seg/slot。
-- [ ] **释放 area（唯一真源）**：`kernel/fork.c:1174` `__mmput` 里、`exit_mmap(mm)` **之后**调
-      `sched_hint_free_area(mm)`：遍历段链表逐段 `put_page` 所有 pages + free 位图 + free 段结构，最后 free area
-      + 置 NULL。只跑一次。段结构须活到此刻（VMA 持有其内嵌 `spec` 指针）。**与 `.close` 职责划分**：
-      `.close` 空转，释放只在这里，从根上杜绝 double-free 和 32 位 munmap-UAF。
-- [ ] **prctl 错误路径**：若 area 已建但后续步骤失败，就地释放 area 并把 `mm->sched_hint_area` 置回 NULL。
+- [x] **DF1**：`mm_init()` 经 `mm_init_sched_hint(mm)` helper 清 `mm->sched_hint_area`（与
+      `mm_init_owner`/`mm_init_uprobes_state` 同款模式）。fresh mm 和 dup mm 都过这里。
+- [x] **DF2（最关键）**：`dup_task_struct()` 在"继承指针脱离"集群（`splice_pipe`/`wake_q` 一带）清三字段，
+      kaddr 用 `WRITE_ONCE`（与其余写点标注统一）。否则子线程继承父 seg/slot → 退出时释放父的 slot。
+- [x] **UAF2**：`fs/exec.c` `begin_new_exec()` 在 `exec_mmap()` 紧前清三字段（kaddr `WRITE_ONCE`），清而不还
+      slot——旧位图随 area 在 `__mmput` 整体销毁。失败语义已核实：`bprm->point_of_no_return`（de_thread 之前）
+      之后所有失败均致命（SIGKILL 已 pending，或 `bprm_execve` out: 的 `force_fatal_sig(SIGSEGV)`）；唯一幸存的
+      失败（`bprm_creds_from_file`）发生在清点之前。
+- [x] **删除旧 pin 代码**：free_task 的 unpin 段 + copy_thread 后的 clone-pin 段（fork.c，共 -45 行）。
+- [x] **free_task 不还 slot**：对 hint 零操作（`WARN_ON_ONCE(kaddr)` 断言为可选项，未加）。
+- [x] **还 slot 放对位置**：`kernel/exit.c` `do_exit` 在 `exit_mm()` 之前调 `sched_hint_exit_task(tsk)`：
+      经 `task->sched_hint_seg` 持 `area->lock` 清段位图 bit + 清本 task kaddr/seg/slot。
+- [x] **释放 area（唯一真源）**：`kernel/fork.c` `__mmput` 在 `exit_mmap(mm)` 之后调 `sched_hint_free_area(mm)`。
+      段结构须活到此刻（VMA 持有其内嵌 `spec` 指针）；`.close` 空转，释放只在这里。
+- [x] **prctl 错误路径**：**决定不做**。空 area 无害（重试语义与无 area 完全一致，`__mmput` 兜底回收）；
+      有段的 area **必须**保留（VMA 持有 `&seg->spec`，回滚即 UAF）。唯一影响正确性的回滚（slot 位）已在
+      put_user 失败路径实现；本条字面的"就地释放"在常见失败形态（EFAULT/配页失败）下是 UAF 陷阱。
 
 ### 阶段 E：sched_ext / BPF 侧
 - [ ] `kernel/sched/ext.c`：删除 `scx_bpf_clear_sched_hint` kfunc + BTF 注册。

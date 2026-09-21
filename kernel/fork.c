@@ -554,13 +554,6 @@ void free_task(struct task_struct *tsk)
 	if (tsk->flags & PF_KTHREAD)
 		free_kthread_struct(tsk);
 	bpf_task_storage_free(tsk);
-#ifdef CONFIG_SCHED_HINT
-	if (tsk->sched_hint_page) {
-		unpin_user_page(tsk->sched_hint_page);
-		tsk->sched_hint_page = NULL;
-		tsk->sched_hint_kaddr = NULL;
-	}
-#endif
 	free_task_struct(tsk);
 }
 EXPORT_SYMBOL(free_task);
@@ -979,6 +972,12 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->task_frag.page = NULL;
 	tsk->wake_q.next = NULL;
 	tsk->worker_private = NULL;
+#ifdef CONFIG_SCHED_HINT
+	/* A fresh task owns no hint slot; do not inherit the parent's. */
+	tsk->sched_hint_seg = NULL;
+	tsk->sched_hint_slot = -1;
+	WRITE_ONCE(tsk->sched_hint_kaddr, NULL);
+#endif
 
 	kcov_task_init(tsk);
 	kmsan_task_create(tsk);
@@ -1067,6 +1066,14 @@ static void mm_init_uprobes_state(struct mm_struct *mm)
 #endif
 }
 
+static void mm_init_sched_hint(struct mm_struct *mm)
+{
+#ifdef CONFIG_SCHED_HINT
+	/* dup_mm memcpy's the parent mm; a child mm must not alias its area. */
+	mm->sched_hint_area = NULL;
+#endif
+}
+
 static void mmap_init_lock(struct mm_struct *mm)
 {
 	init_rwsem(&mm->mmap_lock);
@@ -1096,6 +1103,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_init_cpumask(mm);
 	mm_init_aio(mm);
 	mm_init_owner(mm, p);
+	mm_init_sched_hint(mm);
 	mm_pasid_init(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
 	mmu_notifier_subscriptions_init(mm);
@@ -1180,6 +1188,9 @@ static inline void __mmput(struct mm_struct *mm)
 	ksm_exit(mm);
 	khugepaged_exit(mm); /* must run before exit_mmap */
 	exit_mmap(mm);
+#ifdef CONFIG_SCHED_HINT
+	sched_hint_free_area(mm); /* after exit_mmap: VMAs and PTE refs gone */
+#endif
 	mm_put_huge_zero_folio(mm);
 	set_mm_exe_file(mm, NULL);
 	if (!list_empty(&mm->mmlist)) {
@@ -2240,38 +2251,6 @@ __latent_entropy struct task_struct *copy_process(
 	retval = copy_thread(p, args);
 	if (retval)
 		goto bad_fork_cleanup_io;
-
-#ifdef CONFIG_SCHED_HINT
-	/*
-	 * At this point, we did copy_mm already.
-	 * No need for copy mm->sched_hint_offset.
-	 */
-	if (clone_flags & CLONE_SETTLS && p->mm->has_sched_hint) {
-		unsigned long new_tp = args->tls;
-		unsigned long hint_vaddr = new_tp + p->mm->sched_hint_offset;
-		if (!access_ok((void __user *)hint_vaddr, 64)) {
-			retval = -EINVAL;
-		}
-		struct page *page;
-		struct sched_hint *hint;
-		if ((retval = pin_user_pages_fast(hint_vaddr, 1,
-						  FOLL_WRITE | FOLL_LONGTERM,
-						  &page)) == 1) {
-			retval = 0;
-			hint = (struct sched_hint *)
-				(page_address(page) + (hint_vaddr & ~PAGE_MASK));
-			/* Validate the magic number */
-			if (hint && hint->magic == SCHED_HINT_MAGIC) {
-				p->sched_hint_kaddr = hint;
-				p->sched_hint_page = page;
-			} else {
-				retval = -EINVAL;
-			}
-		}
-		if (retval)
-			goto bad_fork_cleanup_io;
-	}
-#endif
 
 	stackleak_task_init(p);
 

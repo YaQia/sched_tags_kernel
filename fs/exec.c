@@ -1145,6 +1145,16 @@ int begin_new_exec(struct linux_binprm * bprm)
 	 * Release all of the old mmap stuff
 	 */
 	acct_arg_size(bprm, 0);
+#ifdef CONFIG_SCHED_HINT
+	/*
+	 * Clear before exec_mmap(): the old mm's hint area dies with its
+	 * last reference there. The slot is not returned -- the bitmap
+	 * dies with the area.
+	 */
+	me->sched_hint_seg = NULL;
+	me->sched_hint_slot = -1;
+	WRITE_ONCE(me->sched_hint_kaddr, NULL);
+#endif
 	retval = exec_mmap(bprm->mm);
 	if (retval)
 		goto out;

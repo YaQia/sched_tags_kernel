@@ -8,6 +8,7 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
+#include <linux/sched/hint.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/task.h>
@@ -961,6 +962,10 @@ void __noreturn do_exit(long code)
 	 */
 	unwind_deferred_task_exit(tsk);
 
+#ifdef CONFIG_SCHED_HINT
+	/* Return the hint slot while ->mm still reaches the area. */
+	sched_hint_exit_task(tsk);
+#endif
 	exit_mm();
 
 	if (group_dead)
