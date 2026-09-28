@@ -11,6 +11,7 @@
 #include <linux/mm_types.h>
 #include <linux/mmap_lock.h>
 #include <linux/mutex.h>
+#include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
@@ -399,6 +400,18 @@ void sched_hint_free_area(struct mm_struct *mm)
 	if (!area)
 		return;
 	mm->sched_hint_area = NULL;
+
+	/*
+	 * Runs at __mmput with mm_users == 0: every thread of this mm has
+	 * already NULLed its own sched_hint_kaddr (exit/exec, before dropping
+	 * its mm reference), and a kaddr only ever points into its own mm's
+	 * area, so no live task still holds a pointer into this area. The one
+	 * exception is scx_bpf_clear_sched_hint(): as an RCU-protected kfunc
+	 * it may have loaded a still-valid kaddr just before that store and be
+	 * about to write the slot. Drain those in-flight readers before
+	 * put_page(), otherwise the write could land in a freed/reused page.
+	 */
+	synchronize_rcu();
 
 	list_for_each_entry_safe(seg, tmp, &area->segments, node) {
 		for (i = 0; i < seg->nr_pages; i++)

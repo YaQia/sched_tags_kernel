@@ -7360,14 +7360,31 @@ __bpf_kfunc void scx_bpf_events(struct scx_event_stats *events,
 }
 
 #ifdef CONFIG_SCHED_HINT
+/*
+ * Clear @p's hint payload (preserving the magic/version header). @p need not
+ * be current, so the kernel is a genuine second writer to the slot. If @p is
+ * running its own userspace on another CPU this can race a userspace write to
+ * the same slot: fields are naturally aligned single stores so no value tears,
+ * but an update may be lost (the hint ends up stale or cleared). That is fine
+ * for advisory data -- the intended use is clearing a task the scheduler is
+ * operating on (dispatch/stop), which is not in userspace and has no competing
+ * writer. Callers that clear an arbitrary running task get best-effort
+ * semantics.
+ *
+ * Memory safety holds for any @p: @p is KF_RCU, so this runs in an RCU
+ * read-side critical section, and READ_ONCE pairs with the WRITE_ONCE(NULL) at
+ * exit/exec teardown. Either we see NULL and bail, or we see a pointer whose
+ * backing page cannot be freed until sched_hint_free_area() passes a grace
+ * period -- so this memset() never lands in a freed or reused page.
+ */
 __bpf_kfunc void scx_bpf_clear_sched_hint(struct task_struct *p)
 {
-	struct sched_hint *hint = p->sched_hint_kaddr;
+	struct sched_hint *hint = READ_ONCE(p->sched_hint_kaddr);
+
 	if (!hint)
 		return;
-	memset((char *)hint + offsetof(struct sched_hint, exec_dense),
-	       0,
-	       sizeof(struct sched_hint) - offsetof(struct sched_hint, exec_dense));
+	memset((char *)hint + offsetof(struct sched_hint, exec_dense), 0,
+	       sizeof(*hint) - offsetof(struct sched_hint, exec_dense));
 }
 #endif
 

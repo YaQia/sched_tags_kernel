@@ -225,10 +225,25 @@ int                        sched_hint_slot;  /* 段内 slot 号；-1 = 无 */
       有段的 area **必须**保留（VMA 持有 `&seg->spec`，回滚即 UAF）。唯一影响正确性的回滚（slot 位）已在
       put_user 失败路径实现；本条字面的"就地释放"在常见失败形态（EFAULT/配页失败）下是 UAF 陷阱。
 
-### 阶段 E：sched_ext / BPF 侧
-- [ ] `kernel/sched/ext.c`：删除 `scx_bpf_clear_sched_hint` kfunc + BTF 注册。
-- [ ] `tools/sched_ext/include/scx/common.bpf.h`：删除该 kfunc 声明。
-- [ ] 确认跨任务读点仍用 `p->sched_hint_kaddr`（语义不变，只是指针来源变了）。
+### 阶段 E：sched_ext / BPF 侧 ✅（保留 clear，补内存序）
+> 改主意：不删 `scx_bpf_clear_sched_hint`。它给 sched_ext 一个消费/ack 一次性 hint 的能力，很有用。
+> 内核成为**真正的第二写者**（`p` 任意）。若 `p` 正在别的 CPU 跑用户态，clear 会和用户态写竞争——
+> 但字段都是自然对齐单条 store，不撕裂，最坏是**丢更新**（hint 被误清/读到旧值），对 advisory 提示可接受。
+> 预期用法是 clear 调度器正在操作的任务（dispatch/stop，非用户态、无竞争写者）；任意 running task 是
+> best-effort。**曾考虑加 on-CPU 状态检查**拒绝跑着的任务——否决：有 TOCTOU 竞态给不出保证，且要防的只是
+> 「丢更新」而非损坏，负收益；对页释放轴也无能为力（那需要 `p` 在 exit/exec，on-CPU 检查捕捉不到）。
+> 真正的内存安全风险是 clear 作为**写者**把读路径能容忍的「读者 vs 拆除」窗口升级成了往已释放/复用页里写
+> → 必须补 RCU 栅栏（下条），状态检查替代不了。
+- [x] **保留 kfunc + BTF**：`p` 仍任意 task、仍 `KF_RCU`（不约束 current，给扩展标签留空间）。
+- [x] **kfunc 读改 `READ_ONCE`**：`ext.c` `hint = READ_ONCE(p->sched_hint_kaddr)`，与 exit/exec 的
+      `WRITE_ONCE(NULL)` 发布者配对；见 NULL 即 bail。memset 从 `offsetof(exec_dense)` 起、保住 magic/version。
+- [x] **补宽限期（关键）**：`sched_hint_free_area` 在 `put_page` 循环**之前** `synchronize_rcu()`。
+      正确性支点：`free_area` 在 `__mmput`（`mm_users==0`）跑，此刻每个线程都已在 exit/exec 里 NULL 掉自己的
+      kaddr（且先于释放 mm 引用），而 kaddr 只会指向本 mm 的 area → 无活 task 再持本 area 指针；唯一可能仍
+      握着 slot 指针的就是「NULL 之前刚 READ_ONCE 到旧值」的在途 clear（RCU 读侧），宽限期正好把它排空。
+      这条同时把纯读路径那个老窗口（读到已释放页，无害）一并关死。
+- [x] `common.bpf.h` 声明：签名不变（仍收 `struct task_struct *p`），无需改。
+- [x] 确认跨任务读点仍用 `p->sched_hint_kaddr`（语义不变，只是指针来源变了）。
 
 ### 阶段 F：用户态 Pass 与 header-only（sched_tags repo，另一个 repo）
 - [ ] `sched_tags/include/sched_tag.h`：从「定义 TLS 变量 `__sched_hint_data`」改为
