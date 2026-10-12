@@ -199,9 +199,15 @@ int                        sched_hint_slot;  /* 段内 slot 号；-1 = 无 */
       段内嵌的 `spec`；`.fault` 经 `container_of` 回到段、**无锁**读 `READ_ONCE(seg->pages[pgoff])`，
       `get_page`+`vmf->page`（不用 `vm_insert_page`）。`sm->close` 留 NULL（special_mapping_close
       判空跳过 = 空转），释放唯一在 `__mmput`。`sm->mremap` 返回 `-EINVAL`。
-- [x] flags：`VM_SEALED | VM_DONTCOPY | VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE`
-      （`VM_DONTEXPAND` 由 `__install_special_mapping` 自动补）。
+- [x] flags：`VM_SEALED | VM_DONTCOPY | VM_READ | VM_WRITE | VM_SHARED | VM_MAYREAD | VM_MAYWRITE |
+      VM_MAYSHARE`（`VM_DONTEXPAND` 由 `__install_special_mapping` 自动补）。
       64 位 mseal 拦截免费生效；32 位 `VM_SEALED==VM_NONE` no-op，靠 refcount 兜底。
+      **`VM_SHARED` 是实机测试（2026-09-28）补上的关键 flag**：漏掉时映射是私有的，用户态首次写触发 COW，
+      PTE 从此指向副本——用户写的 tag 落在副本、调度器经 `kaddr` 读原页，双向失联（测试表象：被用户写过的页上
+      内核盖的 magic 读回全零）。加 `VM_SHARED` 后用户 PTE 与 `kaddr` 直映射别名同一物理页。
+      已核实无副作用：`__install_special_mapping` 接受任意 flags 且 `vm_page_prot` 随之变共享可写；
+      `vma_wants_writenotify` 为 false（无 `page_mkwrite`/无 file backing/安装时已置 `VM_SOFTDIRTY`）；
+      共享写产生的 `PG_dirty` 不在 `PAGE_FLAGS_CHECK_AT_FREE` 里，释放无 bad-page 报告。
 - [x] `.fault` 只映射已注册 slot 的页、其余 SIGBUS（决策与理由见第 2 节流程 3）。
 
 ### 阶段 D：fork / exit 清理 ✅（DF/UAF 向量逐条处理）

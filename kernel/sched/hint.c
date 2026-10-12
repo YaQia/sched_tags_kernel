@@ -167,9 +167,18 @@ sched_hint_seg_create(struct mm_struct *mm, struct sched_hint_area *area)
 		goto err_free;
 	}
 
+	/*
+	 * VM_SHARED is load-bearing: the user PTE and the kernel direct map
+	 * (kaddr) must alias the same physical page, or the user writes tags
+	 * the scheduler never sees. Without it the mapping is private, the
+	 * first user write COWs the page, and each side keeps reading its
+	 * own copy -- the registration test caught exactly that: stamped
+	 * magic read back as zeroes from any page userspace had written to.
+	 */
 	vma = _install_special_mapping(mm, addr, len,
-				       VM_READ | VM_WRITE | VM_MAYREAD |
-				       VM_MAYWRITE | VM_SEALED | VM_DONTCOPY,
+				       VM_READ | VM_WRITE | VM_SHARED |
+				       VM_MAYREAD | VM_MAYWRITE | VM_MAYSHARE |
+				       VM_SEALED | VM_DONTCOPY,
 				       &seg->spec);
 	if (IS_ERR(vma)) {
 		ret = PTR_ERR(vma);
