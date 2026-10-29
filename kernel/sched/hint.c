@@ -24,15 +24,15 @@
  * and the LLVM pass. Pin it down at compile time.
  */
 static_assert(sizeof(struct sched_hint) == 64);
-static_assert(offsetof(struct sched_hint, exec_dense) == 8);
+static_assert(offsetof(struct sched_hint, funit_dense) == 8);
 static_assert(offsetof(struct sched_hint, memory_dense) == 9);
 static_assert(offsetof(struct sched_hint, atomic_dense) == 10);
 static_assert(offsetof(struct sched_hint, unshared) == 11);
-static_assert(offsetof(struct sched_hint, load_trend) == 12);
+static_assert(offsetof(struct sched_hint, dep_role) == 12);
+static_assert(offsetof(struct sched_hint, load_ahead) == 13);
 static_assert(offsetof(struct sched_hint, atomic_magic) == 16);
-static_assert(offsetof(struct sched_hint, dep_magic) == 24);
-static_assert(offsetof(struct sched_hint, unshared_magic) == 32);
-static_assert(offsetof(struct sched_hint, dep_role) == 40);
+static_assert(offsetof(struct sched_hint, unshared_magic) == 24);
+static_assert(offsetof(struct sched_hint, dep_magic) == 32);
 
 /*
  * A segment's VMA spans nr_pages << PAGE_SHIFT bytes, capped at
@@ -53,9 +53,9 @@ static_assert(SCHED_HINT_SEG_MAX_PAGES <= (~0UL >> PAGE_SHIFT));
  * DWARF -> BTF, and `bpftool btf dump` makes them visible in vmlinux.h.
  */
 enum sched_hint_metadata *__btf_sched_hint_metadata __maybe_unused;
-enum sched_hint_exec_dense *__btf_sched_hint_exec_dense __maybe_unused;
+enum sched_hint_funit_dense *__btf_sched_hint_funit_dense __maybe_unused;
 enum sched_hint_memory_dense *__btf_sched_hint_memory_dense __maybe_unused;
-enum sched_hint_load_trend *__btf_sched_hint_load_trend __maybe_unused;
+enum sched_hint_load_ahead *__btf_sched_hint_load_ahead __maybe_unused;
 enum sched_hint_atomic_dense *__btf_sched_hint_atomic_dense __maybe_unused;
 enum sched_hint_unshared *__btf_sched_hint_unshared __maybe_unused;
 enum sched_hint_dep_role *__btf_sched_hint_dep_role __maybe_unused;
