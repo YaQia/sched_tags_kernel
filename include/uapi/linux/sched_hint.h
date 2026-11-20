@@ -25,20 +25,16 @@
  * does it changes HERE, in one place. Bump SCHED_HINT_VERSION on any change;
  * the kernel stamps magic/version into each slot when handing it out.
  *
- * tag semantics (all magic words are exact 64-bit identity keys):
- *   - unshared       : the one lock currently waited on / held
- *   - atomic_dense   : the identity of the current atomic-variable SET
- *   - dep_role       : the one producer/consumer handoff object currently used,
- *                      plus this thread's role
- *
- * Each magic word is directly usable as an exact hash-map key by the
- * scheduler: equal keys mean the same lock / set / handoff object. Nesting is
- * handled by userspace save/restore tokens; the scheduler only ever sees the
- * innermost current object.
- *
- * Tags fall into two classes, and the layout groups them that way:
+ * Tags fall into two classes:
  *   - hardware resource : compute_dense, memory_dense, atomic_dense
  *   - software contract : unshared, dep_role
+ *
+ * Some tags carry an opaque 64-bit magic key. Its encoding and comparison
+ * rule are tag-specific; see the tag definitions below. Do not assume a
+ * common meaning across tags.
+ *
+ * Nesting is handled by userspace save/restore tokens; the scheduler only
+ * sees the innermost current object.
  */
 
 #include <linux/types.h>
@@ -151,16 +147,17 @@ enum sched_hint_dep_role {
  *   [13..15]  reserved       (alignment padding; free for future state bytes)
  *
  *   Magic words, mirroring the state-byte order (every magic sits below its
- *   state byte). Each is an exact 64-bit identity key:
+ *   state byte). atomic_dense/unshared/dep use exact identity keys:
  *   [16..23]  atomic_magic   exact hash of the current atomic-variable set
  *   [24..31]  unshared_magic exact key of the current lock
  *   [32..39]  dep_magic      exact key of the current handoff object
  *
- *   Memory locality keys, valid while memory_dense is active:
+ *   Memory locality keys, valid while memory_dense is active. local_memory_magic
+ *   is compared by similarity; global_memory_magic by equality:
  *   [40..47]  local_memory_magic   per-mm hot-page sketch
  *   [48..55]  global_memory_magic  cross-process shared-object identity
  *
- *   Key derivation is a userspace contract:
+ *   Exact-key derivation is a userspace contract:
  *     pointer identity : key = hash64(ptr ^ per-process salt)
  *     static identity  : key = hash64(id)
  *   Pointer keys are only meaningful inside one process; use static ids for
@@ -187,7 +184,11 @@ struct sched_hint {
 	__u64 unshared_magic;
 	__u64 dep_magic;
 
-	/* memory locality keys (16 bytes) */
+	/*
+	 * Memory locality keys; valid while memory_dense is active.
+	 * local_memory_magic: per-mm 4x16-bit MinHash sketch of hot pages.
+	 * global_memory_magic: cross-process shared-object identity.
+	 */
 	__u64 local_memory_magic;
 	__u64 global_memory_magic;
 
