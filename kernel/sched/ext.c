@@ -7383,8 +7383,8 @@ __bpf_kfunc void scx_bpf_clear_sched_hint(struct task_struct *p)
 
 	if (!hint)
 		return;
-	memset((char *)hint + offsetof(struct sched_hint, funit_dense), 0,
-	       sizeof(*hint) - offsetof(struct sched_hint, funit_dense));
+	memset((char *)hint + offsetof(struct sched_hint, compute_dense), 0,
+	       sizeof(*hint) - offsetof(struct sched_hint, compute_dense));
 }
 #endif
 

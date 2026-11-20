@@ -251,12 +251,9 @@ int                        sched_hint_slot;  /* 段内 slot 号；-1 = 无 */
 - [x] `common.bpf.h` 声明：签名不变（仍收 `struct task_struct *p`），无需改。
 - [x] 确认跨任务读点仍用 `p->sched_hint_kaddr`（语义不变，只是指针来源变了）。
 
-### 阶段 F：用户态 Pass 与 header-only（sched_tags repo，另一个 repo）
+### 阶段 F：用户态 header-only（sched_tags repo，另一个 repo）
 - [ ] `sched_tags/include/sched_tag.h`：从「定义 TLS 变量 `__sched_hint_data`」改为
       「`__thread struct sched_hint *`（缓存指针）+ 线程首次使用时 `prctl(PR_SET_SCHED_HINT, &ptr)` 惰性注册」。
-- [ ] LLVM Pass（`sched_tags/pass/`）：插桩形态从「写 `__sched_hint.data`」改为
-      「确保本线程已注册、经缓存指针写 `hint->field`」。这是 Pass 大改，需重新设计插桩点
-      （可能在函数入口/首次标注前插入注册检查）。
 - [ ] `sched_tags` 的 prctl 构造器逻辑（原 `emitPrctlConstructor`）：语义完全变了，重做或删除。
 - [ ] 测试（`sched_tags/test/`）：readers 从直接引用 TLS 变量改为经 prctl 拿指针；
       更新 reader_dynamic.h 等。

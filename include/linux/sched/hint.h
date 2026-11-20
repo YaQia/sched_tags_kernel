@@ -3,10 +3,10 @@
 #define _LINUX_SCHED_HINT_KERNEL_H
 
 /*
- * The sched_hint ABI (struct + enums + magic/version + bloom params) lives in
- * the single source of truth <uapi/linux/sched_hint.h>, shared with userspace
- * and the LLVM pass via `make headers_install`. This internal header only adds
- * the in-kernel prctl prototype.
+ * The sched_hint ABI (struct + enums + magic/version) lives in the single
+ * source of truth <uapi/linux/sched_hint.h>, shared with userspace via
+ * `make headers_install`. This internal header only adds the in-kernel
+ * prctl prototype.
  */
 #include <uapi/linux/sched_hint.h>
 

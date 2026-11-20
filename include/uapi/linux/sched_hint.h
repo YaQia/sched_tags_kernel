@@ -9,30 +9,43 @@
  * via `make headers_install`, with:
  *   - the kernel      (include/linux/sched/hint.h wraps this + prctl proto)
  *   - userspace       (#include <linux/sched_hint.h>)
- *   - the LLVM pass   (same, on the compiler's header search path)
  *   - BPF schedulers  (through BTF / vmlinux.h; do NOT include this header)
  *
  * One instance lives per THREAD, in a slot of a kernel-owned page mapped
  * into the process. Each thread calls prctl(PR_SET_SCHED_HINT, &ptr, 0, 0, 0)
  * once; the kernel registers it, back-fills ptr with its slot address, and
- * reads it lazily at
- * scheduling hooks. Every write is a plain store — non-zero payload = active.
+ * reads it lazily at scheduling hooks. Every write is a plain store -- non-zero
+ * state byte = active.
+ *
+ * Hints are sampled at scheduling hooks. A hint is only observed if it is
+ * active at a hook. Short userspace-only regions may never be observed.
+ * Hints are advisory and must not be used for correctness.
  *
  * ABI is NOT yet stable (prototype phase): the layout may change, but when it
  * does it changes HERE, in one place. Bump SCHED_HINT_VERSION on any change;
  * the kernel stamps magic/version into each slot when handing it out.
  *
- * Tags fall into three classes, and the layout groups them that way:
- *   - hardware resource : funit_dense, memory_dense, atomic_dense
+ * tag semantics (all magic words are exact 64-bit identity keys):
+ *   - unshared       : the one lock currently waited on / held
+ *   - atomic_dense   : the identity of the current atomic-variable SET
+ *   - dep_role       : the one producer/consumer handoff object currently used,
+ *                      plus this thread's role
+ *
+ * Each magic word is directly usable as an exact hash-map key by the
+ * scheduler: equal keys mean the same lock / set / handoff object. Nesting is
+ * handled by userspace save/restore tokens; the scheduler only ever sees the
+ * innermost current object.
+ *
+ * Tags fall into two classes, and the layout groups them that way:
+ *   - hardware resource : compute_dense, memory_dense, atomic_dense
  *   - software contract : unshared, dep_role
- *   - forecast          : load_ahead
  */
 
 #include <linux/types.h>
 
 /*
  * We use enums here so the constants are exported into BTF (vmlinux.h) for
- * BPF schedulers, and shared symbolically with userspace and the LLVM pass.
+ * BPF schedulers, and shared symbolically with userspace.
  */
 enum sched_hint_metadata {
 	SCHED_HINT_MAGIC = 0x48494E54U, /* "HINT" in ASCII */
@@ -44,23 +57,22 @@ enum sched_hint_metadata {
  */
 
 /*
- * Which CPU functional units this region leans on. "funit" (functional unit)
- * is the per-core execution resource.
- * The mask granularity exists for SMT pairing: two tasks whose funit masks do
+ * Which kind of CPU compute this region leans on.
+ * The mask granularity exists for SMT pairing: two tasks whose compute masks do
  * not overlap make good sibling threads (e.g. SIMD-heavy paired with
- * branch-heavy), since they press on different units.
+ * branch-heavy), since they press on different execution units.
  */
-enum sched_hint_funit_dense {
-	SCHED_FUNIT_NONE = 0,
-	SCHED_FUNIT_INT = (1U << 0),   /* integer ALU */
-	SCHED_FUNIT_FLOAT = (1U << 1), /* floating point */
-	SCHED_FUNIT_SIMD = (1U << 2),  /* vector / SIMD */
-	SCHED_FUNIT_CTRL = (1U << 3),  /* branch / control flow */
+enum sched_hint_compute_dense {
+	SCHED_COMPUTE_NONE = 0,
+	SCHED_COMPUTE_INT = (1U << 0),   /* integer ALU */
+	SCHED_COMPUTE_FLOAT = (1U << 1), /* floating point */
+	SCHED_COMPUTE_SIMD = (1U << 2),  /* vector / SIMD */
+	SCHED_COMPUTE_CTRL = (1U << 3),  /* branch / control flow */
 };
 
 /*
- * Memory access pattern of this region. If several threads have the same 
- * memory access pattern, try to isolate them from each other (with cache 
+ * Memory access pattern of this region. If several threads have the same
+ * memory access pattern, try to isolate them from each other (with cache
  * isolation or NUMA node isolation).
  */
 enum sched_hint_memory_dense {
@@ -70,10 +82,17 @@ enum sched_hint_memory_dense {
 };
 
 /*
- * If several threads share the same atomic_magic, they are trying to write the
- * same atomic variable, which will invalidate each other's cache of the atomic 
- * variable. Try to colocate these threads within the same core, so they can not
- * clear each other's cache.
+ * atomic_dense is active when this thread operates on an atomic-variable set.
+ * atomic_magic is the exact 64-bit identity of that set: two tasks are
+ * co-scheduled only when their sets are exactly the same.
+ *
+ * Exact-set matching keeps both the decision and the lookup predictable. A
+ * partial overlap (A: {x}, B: {x,y}) has no guaranteed win: moving B away from
+ * a core that is already good for y can cost more than sharing x gains, and
+ * without knowing the rest of the workload the right placement is unknowable.
+ * The scheduler therefore acts only on exact set equality and leaves partial
+ * overlap to the normal scheduler; exact keys also keep the per-set lookup
+ * O(1) instead of scanning every task that carries an atomic tag.
  */
 enum sched_hint_atomic_dense {
 	SCHED_ATOMIC_NONE = 0,
@@ -85,8 +104,8 @@ enum sched_hint_atomic_dense {
  */
 
 /*
- * Exclusive resources held by tasks. If threads share the same exclusive resource,
- * the scheduler should let the total latency of tasks as small as possible.
+ * unshared is active while this thread waits on or holds one exclusive
+ * resource. unshared_magic is the exact key of that one lock.
  */
 enum sched_hint_unshared {
 	SCHED_UNSHARED_NONE = 0,
@@ -94,42 +113,20 @@ enum sched_hint_unshared {
 };
 
 /*
- * dep_role — this thread's role in a producer/consumer dependency, paired
- * with dep_magic (the shared dependency id).
+ * dep_role -- this thread's role in a producer/consumer dependency, paired
+ * with dep_magic (the exact identity of the current producer/consumer handoff
+ * object: pipe, queue, socket, channel, ring buffer, ...).
+ *
+ * It is a bitmask so a single bidirectional handoff object can be both ends at
+ * once. Different handoff objects use nesting/sequence, not multiple bits: the
+ * scheduler only sees the innermost current object.
  */
 enum sched_hint_dep_role {
 	SCHED_DEP_NONE = 0,
-	SCHED_DEP_PRODUCER = 1,
-	SCHED_DEP_CONSUMER = 2,
+	SCHED_DEP_PRODUCER = (1U << 0),
+	SCHED_DEP_CONSUMER = (1U << 1),
+	SCHED_DEP_BOTH = SCHED_DEP_PRODUCER | SCHED_DEP_CONSUMER,
 };
-
-/*
- * ===== forecast class =====
- */
-
-/*
- * The load phase the thread is about to enter. This is a forecast the
- * application *declares* (it knows what it is about to do), not a trend the
- * kernel *observes*, so acting on it does not wait for load detection.
- */
-enum sched_hint_load_ahead {
-	SCHED_LOAD_NONE = 0,
-	SCHED_LOAD_RISING = 1,  /* about to enter a heavy phase */
-	SCHED_LOAD_FALLING = 2, /* about to wind down / go idle */
-};
-
-/*
- * Bloom-filter parameters for all tags containing magic.
- * Each 64-byte-aligned pointer sets SCHED_HINT_BLOOM_K bit positions in a
- * 64-bit word:
- *   h = (ptr & ~63) * SCHED_HINT_BLOOM_PRIME
- *   bloom |= (1 << (h & 63)) | (1 << ((h>>16) & 63))
- *         |  (1 << ((h>>32) & 63)) | (1 << ((h>>48) & 63))
- * The scheduler can use the magic as a key to reference all tasks contain the
- * same key.
- */
-#define SCHED_HINT_BLOOM_PRIME 0x9E3779B97F4A7C15ULL /* fibonacci hashing */
-#define SCHED_HINT_BLOOM_K     4
 
 /*
  * struct sched_hint (64 bytes total)
@@ -139,22 +136,26 @@ enum sched_hint_load_ahead {
  *
  *   State bytes, grouped by class (non-zero = active):
  *     hardware resource
- *   [8]       funit_dense    SCHED_FUNIT_xxx bitmask
+ *   [8]       compute_dense  SCHED_COMPUTE_xxx bitmask
  *   [9]       memory_dense   SCHED_MEMORY_xxx
  *   [10]      atomic_dense   SCHED_ATOMIC_xxx, pairs with atomic_magic
  *     software contract
  *   [11]      unshared       SCHED_UNSHARED_xxx, pairs with unshared_magic
- *   [12]      dep_role       SCHED_DEP_xxx, pairs with dep_magic
- *     forecast
- *   [13]      load_ahead     SCHED_LOAD_xxx
- *   [14..15]  reserved       (alignment padding before the magic words; free
- *                             room for the next couple of state bytes)
+ *   [12]      dep_role       SCHED_DEP_xxx bitmask, pairs with dep_magic
+ *   [13..15]  reserved       (alignment padding; free for future state bytes)
  *
  *   Magic words, mirroring the state-byte order (every magic sits below its
- *   state byte): atomic -> unshared -> dep.
- *   [16..23]  atomic_magic   bloom filter for lock-free co-scheduling
- *   [24..31]  unshared_magic bloom filter for exclusive-lock ownership
- *   [32..39]  dep_magic      producer/consumer dependency id
+ *   state byte). Each is an exact 64-bit identity key:
+ *   [16..23]  atomic_magic   exact hash of the current atomic-variable set
+ *   [24..31]  unshared_magic exact key of the current lock
+ *   [32..39]  dep_magic      exact key of the current handoff object
+ *
+ *   Key derivation is a userspace contract:
+ *     pointer identity : key = hash64(ptr ^ per-process salt)
+ *     static identity  : key = hash64(id)
+ *   Pointer keys are only meaningful inside one process; use static ids for
+ *   cross-process objects. The scheduler only sees the hashed key, never a
+ *   raw virtual address.
  *
  *   [40..63]  reserved       all further growth (new magic words, and the
  *                             3rd+ new state byte) carves from the bottom
@@ -165,13 +166,12 @@ struct sched_hint {
 	__u32 version;
 
 	/* state bytes (8 bytes), grouped by class */
-	__u8 funit_dense;  /* SCHED_FUNIT_xxx */
+	__u8 compute_dense; /* SCHED_COMPUTE_xxx */
 	__u8 memory_dense; /* SCHED_MEMORY_xxx */
 	__u8 atomic_dense; /* SCHED_ATOMIC_xxx */
 	__u8 unshared;     /* SCHED_UNSHARED_xxx */
 	__u8 dep_role;     /* SCHED_DEP_xxx */
-	__u8 load_ahead;   /* SCHED_LOAD_xxx */
-	__u8 reserved[2];
+	__u8 reserved[3];
 
 	/* magic words (24 bytes), mirroring state-byte order */
 	__u64 atomic_magic;
