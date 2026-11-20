@@ -71,14 +71,20 @@ enum sched_hint_compute_dense {
 };
 
 /*
- * Memory access pattern of this region. If several threads have the same
- * memory access pattern, try to isolate them from each other (with cache
- * isolation or NUMA node isolation).
+ * How this memory-dense region is shared. Non-zero state means the thread is
+ * currently in a memory-dense phase.
+ *
+ * READ_MOSTLY : writes are negligible, so copies may be spread across LLCs
+ *               to let readers proceed in parallel.
+ * WRITE_HEAVY : writes are frequent enough that cache coherence is the
+ *               bottleneck. Keep such tasks within one LLC, preferring
+ *               same-core / SMT siblings before falling back to separate
+ *               cores in the same LLC.
  */
 enum sched_hint_memory_dense {
 	SCHED_MEMORY_NONE = 0,
-	SCHED_MEMORY_STREAM = 1, /* sequential / streaming */
-	SCHED_MEMORY_RANDOM = 2, /* random access */
+	SCHED_MEMORY_READ_MOSTLY = 1,  /* effectively read-only shared data */
+	SCHED_MEMORY_WRITE_HEAVY = 2,  /* meaningful write traffic */
 };
 
 /*
@@ -150,6 +156,10 @@ enum sched_hint_dep_role {
  *   [24..31]  unshared_magic exact key of the current lock
  *   [32..39]  dep_magic      exact key of the current handoff object
  *
+ *   Memory locality keys, valid while memory_dense is active:
+ *   [40..47]  local_memory_magic   per-mm hot-page sketch
+ *   [48..55]  global_memory_magic  cross-process shared-object identity
+ *
  *   Key derivation is a userspace contract:
  *     pointer identity : key = hash64(ptr ^ per-process salt)
  *     static identity  : key = hash64(id)
@@ -157,8 +167,7 @@ enum sched_hint_dep_role {
  *   cross-process objects. The scheduler only sees the hashed key, never a
  *   raw virtual address.
  *
- *   [40..63]  reserved       all further growth (new magic words, and the
- *                             3rd+ new state byte) carves from the bottom
+ *   [56..63]  reserved       all further growth carves from here
  */
 struct sched_hint {
 	/* header (8 bytes) */
@@ -178,8 +187,12 @@ struct sched_hint {
 	__u64 unshared_magic;
 	__u64 dep_magic;
 
-	/* reserved for future tags (24 bytes) */
-	__u8 reserved2[24];
+	/* memory locality keys (16 bytes) */
+	__u64 local_memory_magic;
+	__u64 global_memory_magic;
+
+	/* reserved for future tags (8 bytes) */
+	__u8 reserved2[8];
 } __attribute__((aligned(64)));
 
 #endif /* _UAPI_LINUX_SCHED_HINT_H */

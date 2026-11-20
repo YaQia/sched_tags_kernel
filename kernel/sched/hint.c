@@ -32,6 +32,8 @@ static_assert(offsetof(struct sched_hint, dep_role) == 12);
 static_assert(offsetof(struct sched_hint, atomic_magic) == 16);
 static_assert(offsetof(struct sched_hint, unshared_magic) == 24);
 static_assert(offsetof(struct sched_hint, dep_magic) == 32);
+static_assert(offsetof(struct sched_hint, local_memory_magic) == 40);
+static_assert(offsetof(struct sched_hint, global_memory_magic) == 48);
 
 /*
  * dep_role is a bitmask; the scheduler may test the individual
